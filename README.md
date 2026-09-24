@@ -59,23 +59,23 @@ cd Rinka-SoundBridge
 
 ### 2. Install Requirements
 
-Jika ingin meng-install Requirements.
+Jika ingin meng-install Requirements, jalankan:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3. Run
+### 3. Run.
 
-Jika ingin menjalankan dari folder.
+Jika ingin menjalankan dari folder, jalankan:
 
 ```bash
 run.bat
 ```
 
-### 4. BUILD
+### 4. Build
 
-jika ingin menjadikan file siap pakai (exe)
+jika ingin menjadikan file siap pakai (exe), jalankan:
 
 ```bash
 Build_exe.bat

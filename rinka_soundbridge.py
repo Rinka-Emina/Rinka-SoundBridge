@@ -3,12 +3,6 @@ Rinka SoundBridge v1.21
 ========================
 Dual-line audio routing dan VST3 host untuk keperluan live streaming/VTubing
 berbasis WASAPI (Windows).
-
-Changelog v1.21:
-- Sistem Hotplug & Refresh Audio Device mandiri tanpa perlu me-restart aplikasi.
-- Smart Name Matching saat refresh perangkat baru agar pilihan tidak tertukar.
-- Safe Delayed Process Restart untuk mencegah tabrakan driver WASAPI (Anti-Crash).
-- Centralized clean_shutdown() untuk menghentikan timer UI dan melepas COM PortAudio.
 """
 
 import sys

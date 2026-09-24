@@ -5,10 +5,11 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Framework](https://img.shields.io/badge/GUI-PyQt6-41CD52?logo=qt)](https://riverbankcomputing.com/software/pyqt/)
 
-**Rinka SoundBridge** adalah aplikasi *standalone dual VST3 host* dan *real-time audio router* berbasis Windows WASAPI yang dirancang sangat ringan (Sepertinya, ya ga tau kok tanya saya). Aplikasi ini diciptakan khusus untuk memenuhi kebutuhan *live streaming*, VTubing, dan rantai pemrosesan *voice changer* eksternal *RINKA EMINA* (seperti Vonovox atau RVC) tanpa perlu membuka DAW penuh yang berat (Reaper, FL Studio, Ableton).
+**Rinka SoundBridge** adalah aplikasi *standalone dual VST3 host* dan *real-time audio router* berbasis Windows WASAPI yang dirancang sangat ringan **(Sepertinya, ya ga tau kok tanya saya)**. Aplikasi ini diciptakan khusus untuk memenuhi kebutuhan *live streaming*, VTubing, dan rantai pemrosesan *voice changer* eksternal **RINKA EMINA** (seperti Vonovox atau RVC) tanpa perlu membuka DAW penuh yang berat (Reaper, FL Studio, Ableton).
 
 > **Catatan Proyek:**  
-> Perangkat lunak ini awalnya dikembangkan secara mandiri dengan bantuan AI untuk memecahkan kebutuhan routing audio dan rantai *voice changer* *pribadi* (daripada membajak kan atau pakai 2 aplikasi beda). Repositori ini dibagikan secara terbuka (*as-is*) bagi siapa saja yang membutuhkan, just in case.
+> Perangkat lunak ini awalnya dikembangkan secara mandiri dengan bantuan AI untuk memecahkan kebutuhan routing audio dan rantai **voice changer** **pribadi** (daripada membajak kan atau pakai 2 aplikasi beda). Repositori ini dibagikan secara terbuka (*as-is*) bagi siapa saja yang membutuhkan, just in case.
+> Jika ada yang ingin mengembangkan lebih lanjut, silahkan saya malah sangat senang dengan hal itu, daripada hasil AI ini. aplikasi ini dibuat hanya untuk menyelesaikan kebutuhan pribadi saya
 
 ---
 

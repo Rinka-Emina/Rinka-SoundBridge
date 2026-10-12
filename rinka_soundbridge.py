@@ -1,8 +1,24 @@
 """
-Rinka SoundBridge v1.21
+Rinka SoundBridge v1.22
 ========================
 Dual-line audio routing dan VST3 host untuk keperluan live streaming/VTubing
 berbasis WASAPI (Windows).
+
+Changelog v1.22 (hasil audit Batch 2 & guard editor VST):
+- Stream: stop()/close() dipisah agar handle WASAPI tidak bocor; cleanup penuh saat restart gagal.
+- Callback audio dibungkus try/except (output di-nol-kan saat error) + hitung xrun + watchdog stream.
+- Config: tulis atomik (.tmp -> os.replace) + backup .bak + fallback load; nama device tersimpan
+  tidak lagi tertimpa None saat device sedang tidak terpasang.
+- VST: guard editor global (satu editor sekaligus, dibuka di luar event klik), kontrol kartu
+  dikunci selama editor terbuka, parameter ditangkap ulang saat shutdown, deteksi NaN/Inf.
+- Logger: antrean berbatas, flush saat shutdown, throttle error VST berbasis interval.
+- Win32: user32 privat (WinDLL), filter kelas jendela Qt pada fix titlebar, thread dilindungi try/except.
+
+Changelog v1.21:
+- Sistem Hotplug & Refresh Audio Device mandiri tanpa perlu me-restart aplikasi.
+- Smart Name Matching saat refresh perangkat baru agar pilihan tidak tertukar.
+- Safe Delayed Process Restart untuk mencegah tabrakan driver WASAPI (Anti-Crash).
+- Centralized clean_shutdown() untuk menghentikan timer UI dan melepas COM PortAudio.
 """
 
 import sys
@@ -10,6 +26,7 @@ import os
 import json
 import time
 import threading
+import shutil
 import subprocess
 import datetime
 import queue
@@ -32,7 +49,7 @@ from PyQt6.QtGui import QFont, QAction, QColor, QPainter
 if sys.platform == "win32":
     import ctypes
     from ctypes import wintypes
-    user32 = ctypes.windll.user32
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
 
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
 
@@ -56,6 +73,9 @@ if sys.platform == "win32":
 
     user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     user32.GetWindowRect.restype = wintypes.BOOL
+
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
 
     user32.GetSystemMetrics.argtypes = [ctypes.c_int]
     user32.GetSystemMetrics.restype = ctypes.c_int
@@ -256,7 +276,9 @@ class RinkaLogger:
         except Exception as e:
             self._safe_print(f"[RinkaLogger] Gagal membuat folder log: {e}")
 
-        self._queue = queue.Queue()
+        # Antrean berbatas: jika disk macet, log baru dibuang (tidak menahan thread audio/UI)
+        self._queue = queue.Queue(maxsize=5000)
+        self._closed = False
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
 
@@ -270,8 +292,14 @@ class RinkaLogger:
 
     def _worker_loop(self):
         while True:
-            level, message = self._queue.get()
-            self._write_now(level, message)
+            item = self._queue.get()
+            if item is None:
+                break
+            level, message = item
+            try:
+                self._write_now(level, message)
+            except Exception:
+                pass
 
     def _ensure_file(self):
         today_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -291,7 +319,30 @@ class RinkaLogger:
             self._file = None
 
     def _write(self, level, message):
-        self._queue.put((level, message))
+        if self._closed:
+            return
+        try:
+            self._queue.put_nowait((level, message))
+        except queue.Full:
+            pass
+
+    def shutdown(self, timeout=1.5):
+        """Kosongkan antrean log lalu tutup file. Dipanggil sekali saat aplikasi keluar."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._queue.put(None, timeout=0.2)
+            self._worker.join(timeout)
+        except Exception:
+            pass
+        with self.lock:
+            if self._file is not None:
+                try:
+                    self._file.close()
+                except Exception:
+                    pass
+                self._file = None
 
     def _write_now(self, level, message):
         with self.lock:
@@ -597,6 +648,10 @@ class OverlayBank:
 
 def soft_limit(audio, threshold=0.9, ceiling=0.99):
     peak = np.max(np.abs(audio)) if audio.size > 0 else 0.0
+    if not np.isfinite(peak):
+        # NaN/Inf dari plugin: perbandingan NaN selalu False sehingga lolos limiter -> bersihkan dulu
+        audio = np.nan_to_num(audio, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32, copy=False)
+        peak = np.max(np.abs(audio))
     if peak <= threshold:
         return audio
 
@@ -681,6 +736,12 @@ def fix_vst_window_titlebar(vst_name, main_win_hwnd, known_hwnds_before=None):
     SWP_SHOWWINDOW = 0x0040
 
     for hwnd in target_hwnds:
+        # Lewati jendela milik Qt sendiri (tooltip, popup combobox, dll) agar tidak ikut diubah gayanya
+        class_buf = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_buf, 256)
+        if class_buf.value.startswith("Qt"):
+            continue
+
         style = user32.GetWindowLongW(hwnd, -16)
         new_style = style | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME
         user32.SetWindowLongW(hwnd, -16, new_style)
@@ -951,8 +1012,26 @@ class AudioPipeline:
         self.overlay_input_bank = OverlayBank()
         self.overlay_output_bank = OverlayBank()
 
+        # Diagnostik callback & watchdog
+        self.in_xruns = 0
+        self.out_xruns = 0
+        self._cb_err_time = 0.0
+        self._cb_err_suppressed = 0
+        self.restart_attempts = 0
+        self._healthy_ticks = 0
+        self._gave_up = False
+        self._last_restart_try = 0.0
+
+    MAX_AUTO_RESTART = 3
+
+    def _reset_watchdog(self):
+        self.restart_attempts = 0
+        self._healthy_ticks = 0
+        self._gave_up = False
+
     def set_enabled(self, enabled):
         self.is_enabled = enabled
+        self._reset_watchdog()
         if not enabled:
             self.stop_stream()
             self.peak_level = 0.0
@@ -961,6 +1040,7 @@ class AudioPipeline:
             self.restart_stream()
 
     def update_devices(self, in_dev, out_dev, sample_rate, buffer_size):
+        self._reset_watchdog()
         self.input_device = in_dev
         self.output_device = out_dev
         self.sample_rate = sample_rate
@@ -1085,32 +1165,60 @@ class AudioPipeline:
             self.probe_out.set_sample_rate(self.sample_rate, seconds=1.8)
             self.status_message = f"🟢 WASAPI Aktif ({self.in_channels} In ➔ {self.out_channels} Out @ {self.sample_rate}Hz)"
         except Exception as e:
+            # Pastikan tidak ada stream setengah-terbuka yang menahan device WASAPI
+            self._close_streams_quietly()
             self.status_message = f"⚠️ Error: {str(e)[:38]}"
             rinka_logger.error(f"[{self.name}] WASAPI Pipeline Error: {e}")
 
-    def stop_stream(self):
-        if self.in_stream is not None:
-            try:
-                self.in_stream.stop()
-                self.in_stream.close()
-            except Exception:
-                pass
-            self.in_stream = None
+    @staticmethod
+    def _close_one_stream(stream):
+        """stop() dan close() dipisah: jika stop() error (device dicabut), close() tetap dijalankan."""
+        if stream is None:
+            return
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
 
-        if self.out_stream is not None:
-            try:
-                self.out_stream.stop()
-                self.out_stream.close()
-            except Exception:
-                pass
-            self.out_stream = None
+    def _close_streams_quietly(self):
+        in_s, out_s = self.in_stream, self.out_stream
+        self.in_stream = None
+        self.out_stream = None
+        self._close_one_stream(in_s)
+        self._close_one_stream(out_s)
+
+    def stop_stream(self):
+        self._close_streams_quietly()
 
         with self.lock:
             for slot in self.vst_slots:
                 slot.latency_buffer = None
         self.fifo.reset()
 
+    def _log_callback_error(self, where, err):
+        now = time.time()
+        if now - self._cb_err_time > 2.0:
+            suppressed = self._cb_err_suppressed
+            self._cb_err_suppressed = 0
+            self._cb_err_time = now
+            extra = f" (+{suppressed} error serupa disembunyikan)" if suppressed else ""
+            rinka_logger.error(f"[{self.name}] Exception di callback {where}: {err!r}{extra}")
+        else:
+            self._cb_err_suppressed += 1
+
     def _in_callback(self, indata, frames, time_info, status):
+        if status:
+            self.in_xruns += 1
+        try:
+            self._process_input(indata)
+        except Exception as e:
+            self._log_callback_error("input", e)
+
+    def _process_input(self, indata):
         if not self.is_enabled:
             return
 
@@ -1130,6 +1238,17 @@ class AudioPipeline:
                 if not slot.bypassed and slot.plugin is not None:
                     try:
                         processed = slot.plugin(audio_stereo, self.sample_rate, reset=False)
+
+                        if not np.isfinite(processed).all():
+                            # Output rusak (NaN/Inf): buang blok ini, bersihkan state plugin, lanjut dengan sinyal sebelumnya
+                            slot.record_error("Output plugin berisi NaN/Inf")
+                            self._log_slot_error(slot, "Output plugin berisi NaN/Inf (state di-reset)")
+                            try:
+                                slot.plugin.reset()
+                            except Exception:
+                                pass
+                            slot.latency_buffer = None
+                            continue
 
                         if processed.ndim == 1:
                             processed = np.stack([processed, processed], axis=0)
@@ -1152,22 +1271,38 @@ class AudioPipeline:
                             audio_stereo = np.concatenate([processed, pad], axis=1)
                     except Exception as fx_err:
                         slot.record_error(str(fx_err))
-                        err_msg = str(fx_err)
-                        now = time.time()
-                        if (slot.error_count == 1
-                                or err_msg != getattr(slot, "_last_logged_error", None)
-                                or now - getattr(slot, "_last_logged_time", 0.0) > 5.0):
-                            rinka_logger.error(
-                                f"[{self.name}] VST '{slot.name}' gagal diproses "
-                                f"(ke-{slot.error_count}x): {err_msg}"
-                            )
-                            slot._last_logged_error = err_msg
-                            slot._last_logged_time = now
+                        self._log_slot_error(slot, str(fx_err))
 
         audio_stereo = soft_limit(audio_stereo)
         self.fifo.write(audio_stereo, max_lead_samples=max(512, self.buffer_size * 4))
 
+    def _log_slot_error(self, slot, err_msg):
+        """Throttle berbasis interval (maks 1 baris / 2 detik per slot), terlepas dari isi pesannya."""
+        now = time.time()
+        last = getattr(slot, "_last_logged_time", 0.0)
+        if now - last >= 2.0:
+            suppressed = getattr(slot, "_suppressed_logs", 0)
+            slot._suppressed_logs = 0
+            slot._last_logged_time = now
+            extra = f" (+{suppressed} error disembunyikan)" if suppressed else ""
+            rinka_logger.error(
+                f"[{self.name}] VST '{slot.name}' gagal diproses "
+                f"(ke-{slot.error_count}x): {err_msg}{extra}"
+            )
+        else:
+            slot._suppressed_logs = getattr(slot, "_suppressed_logs", 0) + 1
+
     def _out_callback(self, outdata, frames, time_info, status):
+        if status:
+            self.out_xruns += 1
+        try:
+            self._render_output(outdata, frames)
+        except Exception as e:
+            outdata.fill(0)
+            self.peak_level = 0.0
+            self._log_callback_error("output", e)
+
+    def _render_output(self, outdata, frames):
         if not self.is_enabled:
             outdata.fill(0)
             self.peak_level = 0.0
@@ -1188,9 +1323,50 @@ class AudioPipeline:
         self.peak_level = min(peak, 1.5)
 
         if self.out_channels == 1:
-            outdata[:] = final_audio[0:1, :].T
+            outdata[:] = final_audio.mean(axis=0)[:, None]
         else:
             outdata[:] = final_audio[:self.out_channels, :].T
+
+    def check_stream_health(self):
+        """Dipanggil periodik dari UI thread. Return True jika status_message berubah."""
+        if not self.is_enabled or self.input_device is None or self.output_device is None:
+            return False
+        ins, outs = self.in_stream, self.out_stream
+        if ins is None or outs is None:
+            return False  # gagal buka sudah dilaporkan oleh restart_stream (status Error)
+
+        try:
+            alive = bool(ins.active and outs.active)
+        except Exception:
+            alive = False
+
+        if alive:
+            self._healthy_ticks += 1
+            if self._healthy_ticks >= 5:
+                self.restart_attempts = 0
+                self._gave_up = False
+            return False
+
+        self._healthy_ticks = 0
+        if self.restart_attempts >= self.MAX_AUTO_RESTART:
+            if not self._gave_up:
+                self._gave_up = True
+                self.status_message = "⚠️ Stream terhenti - matikan/nyalakan Line atau Refresh Device"
+                rinka_logger.error(f"[{self.name}] Stream berhenti & auto-restart gagal {self.restart_attempts}x")
+                return True
+            return False
+
+        now = time.monotonic()
+        if now - self._last_restart_try < 3.0:
+            return False
+        self._last_restart_try = now
+        self.restart_attempts += 1
+        rinka_logger.warning(
+            f"[{self.name}] Stream terdeteksi berhenti, auto-restart "
+            f"({self.restart_attempts}/{self.MAX_AUTO_RESTART})"
+        )
+        self.restart_stream()
+        return True
 
     def add_vst(self, file_path):
         try:
@@ -1531,7 +1707,9 @@ class VSTCardWidget(QFrame):
         self.lbl_title = ClickableElidedLabel(f"[{index + 1}] {slot.name}")
         self.lbl_title.setFixedHeight(28)
         self.lbl_title.setToolTip(f"🎛️ Klik untuk membuka editor GUI: {slot.name}\n📁 {slot.file_path}")
-        self.lbl_title.clicked.connect(lambda: on_edit(self.slot))
+        # Ditunda ke iterasi event-loop berikutnya: show_editor() memblokir, jadi tidak boleh
+        # berjalan di dalam mousePressEvent label (kartu bisa dibangun ulang saat editor terbuka).
+        self.lbl_title.clicked.connect(lambda: QTimer.singleShot(0, lambda s=self.slot: on_edit(s)))
         layout.addWidget(self.lbl_title, stretch=1)
 
         self.lbl_error_dot = QLabel("🔴")
@@ -1731,6 +1909,9 @@ class LinePanelWidget(QFrame):
         self.wasapi_outputs = wasapi_outputs
         self.main_window = main_window
         self._is_editing_vst = False
+        # Nama device pilihan user (bertahan walau device sedang tidak terpasang)
+        self.desired_in_name = None
+        self.desired_out_name = None
 
         self.setFrameShape(QFrame.Shape.StyledPanel)
         self.setStyleSheet(f"""
@@ -1795,6 +1976,7 @@ class LinePanelWidget(QFrame):
         self.cb_input = QComboBox()
         self.cb_input.setStyleSheet(combobox_style())
         self.populate_inputs()
+        self.cb_input.currentIndexChanged.connect(self._remember_input_choice)
         self.cb_input.currentIndexChanged.connect(self.on_device_changed)
         device_layout.addWidget(self.cb_input)
 
@@ -1805,6 +1987,7 @@ class LinePanelWidget(QFrame):
         self.cb_output = QComboBox()
         self.cb_output.setStyleSheet(combobox_style())
         self.populate_outputs()
+        self.cb_output.currentIndexChanged.connect(self._remember_output_choice)
         self.cb_output.currentIndexChanged.connect(self.on_device_changed)
         device_layout.addWidget(self.cb_output)
 
@@ -2007,7 +2190,18 @@ class LinePanelWidget(QFrame):
         self.lbl_vol_val.setStyleSheet(f"color: {Palette.ACCENT_PINK};")
         self.vu_meter.update()
 
+    # populate_* memblokir sinyal, jadi currentIndexChanged hanya datang dari aksi user.
+    def _remember_input_choice(self, _index=None):
+        data = self.cb_input.currentData()
+        self.desired_in_name = data[1] if data else None
+
+    def _remember_output_choice(self, _index=None):
+        data = self.cb_output.currentData()
+        self.desired_out_name = data[1] if data else None
+
     def populate_inputs(self, select_device_name=None):
+        if select_device_name is None:
+            select_device_name = self.desired_in_name
         self.cb_input.blockSignals(True)
         self.cb_input.clear()
         self.cb_input.addItem("🚫 (Tidak Ada / None)", None)
@@ -2020,6 +2214,8 @@ class LinePanelWidget(QFrame):
         self.cb_input.blockSignals(False)
 
     def populate_outputs(self, select_device_name=None):
+        if select_device_name is None:
+            select_device_name = self.desired_out_name
         self.cb_output.blockSignals(True)
         self.cb_output.clear()
         self.cb_output.addItem("🚫 (Tidak Ada / None)", None)
@@ -2261,42 +2457,66 @@ class LinePanelWidget(QFrame):
             card_widget.update_bypass_visual()
             self.main_window.trigger_auto_save()
 
+    def _set_vst_controls_enabled(self, enabled):
+        """Kunci/buka kartu VST & tombol tambah selama editor plugin terbuka."""
+        for card in list(getattr(self, "vst_card_widgets", [])):
+            try:
+                card.setEnabled(enabled)
+            except RuntimeError:
+                pass  # widget sudah dihapus
+        try:
+            self.btn_add_vst.setEnabled(enabled)
+        except RuntimeError:
+            pass
+
     def edit_vst_direct(self, slot):
-        if self._is_editing_vst:
+        mw = self.main_window
+        # Guard global: hanya satu editor VST di seluruh aplikasi (Line A + Line B)
+        if mw.vst_editor_open or self._is_editing_vst:
             return
+        if slot not in self.pipeline.vst_slots:
+            return  # slot sudah dihapus sebelum event tertunda berjalan
+        if not hasattr(slot.plugin, "show_editor"):
+            QMessageBox.information(
+                self, "Info", f"Plugin {slot.name} tidak memiliki GUI kustom terpisah."
+            )
+            return
+
+        mw.vst_editor_open = True
         self._is_editing_vst = True
+        self._set_vst_controls_enabled(False)
 
         try:
-            if hasattr(slot.plugin, "show_editor"):
-                main_hwnd = int(self.main_window.winId())
+            main_hwnd = int(mw.winId())
 
-                if sys.platform == "win32":
-                    known_before = _enum_process_windows(main_hwnd)
+            if sys.platform == "win32":
+                known_before = _enum_process_windows(main_hwnd)
 
-                    def _delayed_titlebar_fix():
+                def _delayed_titlebar_fix():
+                    try:
                         time.sleep(0.06)
                         fix_vst_window_titlebar(slot.name, main_hwnd, known_before)
                         time.sleep(0.19)
                         fix_vst_window_titlebar(slot.name, main_hwnd, known_before)
+                    except Exception as fix_err:
+                        rinka_logger.warning(f"Gagal merapikan titlebar VST: {fix_err}")
 
-                    threading.Thread(target=_delayed_titlebar_fix, daemon=True).start()
+                threading.Thread(target=_delayed_titlebar_fix, daemon=True).start()
 
-                self.lbl_status.setText(f"🎛️ Editor '{slot.name}' terbuka - tutup jendela plugin untuk lanjut")
-                QApplication.processEvents()
+            self.lbl_status.setText(f"🎛️ Editor '{slot.name}' terbuka - tutup jendela plugin untuk lanjut")
+            QApplication.processEvents()
 
-                slot.plugin.show_editor()
-
-                slot.cached_params = capture_vst_parameters(slot.plugin)
-                self.lbl_status.setText(self.pipeline.status_message)
-                self.main_window.trigger_auto_save()
-            else:
-                QMessageBox.information(
-                    self, "Info", f"Plugin {slot.name} tidak memiliki GUI kustom terpisah."
-                )
+            slot.plugin.show_editor()
         except Exception as e:
             QMessageBox.warning(self, "Error GUI VST", f"Gagal membuka jendela GUI plugin: {e}")
         finally:
+            # Selalu tangkap parameter terakhir (juga jika editor error) lalu simpan
+            slot.cached_params = capture_vst_parameters(slot.plugin)
+            mw.vst_editor_open = False
             self._is_editing_vst = False
+            self._set_vst_controls_enabled(True)
+            self.lbl_status.setText(self.pipeline.status_message)
+            mw.trigger_auto_save()
 
     def move_up(self, index):
         if index > 0:
@@ -2323,12 +2543,13 @@ class LinePanelWidget(QFrame):
 class RinkaSoundBridgeWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Rinka SoundBridge v1.21 2026.09")
+        self.setWindowTitle("Rinka SoundBridge v1.22 2026.10")
         self.resize(1020, 940)
         self.setMinimumSize(600, 500)
         self.is_loading_config = False
         self._is_refreshing_devices = False
         self._is_shutting_down = False
+        self.vst_editor_open = False
 
         self.setStyleSheet(f"""
             QMainWindow {{ background-color: {Palette.BG_APP}; }}
@@ -2360,6 +2581,11 @@ class RinkaSoundBridgeWindow(QMainWindow):
         self.vst_error_timer.setInterval(1000)
         self.vst_error_timer.timeout.connect(self.update_vst_error_indicators)
         self.vst_error_timer.start()
+
+        self.stream_watchdog_timer = QTimer(self)
+        self.stream_watchdog_timer.setInterval(2000)
+        self.stream_watchdog_timer.timeout.connect(self.check_stream_health)
+        self.stream_watchdog_timer.start()
 
         if PSUTIL_AVAILABLE:
             self._perf_process = psutil.Process(os.getpid())
@@ -2633,6 +2859,22 @@ class RinkaSoundBridgeWindow(QMainWindow):
             self.panel_line_a.refresh_all_error_indicators()
             self.panel_line_b.refresh_all_error_indicators()
 
+    def check_stream_health(self):
+        """Watchdog: deteksi stream WASAPI yang mati diam-diam & tampilkan jumlah xrun."""
+        if self._is_shutting_down or self._is_refreshing_devices or self.vst_editor_open:
+            return
+        for pipeline, panel in ((self.pipeline_a, self.panel_line_a), (self.pipeline_b, self.panel_line_b)):
+            try:
+                changed = pipeline.check_stream_health()
+            except Exception as e:
+                rinka_logger.error(f"[{pipeline.name}] Watchdog error: {e}")
+                changed = False
+            if changed:
+                panel.lbl_status.setText(pipeline.status_message)
+            tip = f"Xrun (underflow/overflow): In {pipeline.in_xruns} | Out {pipeline.out_xruns}"
+            if panel.lbl_status.toolTip() != tip:
+                panel.lbl_status.setToolTip(tip)
+
     def update_performance_indicator(self):
         if not PSUTIL_AVAILABLE:
             return
@@ -2697,10 +2939,12 @@ class RinkaSoundBridgeWindow(QMainWindow):
         if hasattr(self, "_save_debounce_timer"):
             self._save_debounce_timer.stop()
 
-        in_a = self.panel_line_a.cb_input.currentData()
-        out_a = self.panel_line_a.cb_output.currentData()
-        in_b = self.panel_line_b.cb_input.currentData()
-        out_b = self.panel_line_b.cb_output.currentData()
+        # Pakai nama pilihan user (bukan isi combobox saat ini) agar tidak tertimpa None
+        # ketika device sedang tidak terpasang.
+        in_a_name = self.panel_line_a.desired_in_name
+        out_a_name = self.panel_line_a.desired_out_name
+        in_b_name = self.panel_line_b.desired_in_name
+        out_b_name = self.panel_line_b.desired_out_name
 
         def _serialize_vst_slots(pipeline):
             result = []
@@ -2734,8 +2978,8 @@ class RinkaSoundBridgeWindow(QMainWindow):
             },
             "line_a": {
                 "is_enabled": self.pipeline_a.is_enabled,
-                "input_device_name": in_a[1] if in_a else None,
-                "output_device_name": out_a[1] if out_a else None,
+                "input_device_name": in_a_name,
+                "output_device_name": out_a_name,
                 "master_volume": self.panel_line_a.slider_vol.value(),
                 "is_muted": self.pipeline_a.is_muted,
                 "overlay_input": _serialize_overlay_bank(self.pipeline_a.overlay_input_bank),
@@ -2744,8 +2988,8 @@ class RinkaSoundBridgeWindow(QMainWindow):
             },
             "line_b": {
                 "is_enabled": self.pipeline_b.is_enabled,
-                "input_device_name": in_b[1] if in_b else None,
-                "output_device_name": out_b[1] if out_b else None,
+                "input_device_name": in_b_name,
+                "output_device_name": out_b_name,
                 "master_volume": self.panel_line_b.slider_vol.value(),
                 "is_muted": self.pipeline_b.is_muted,
                 "overlay_input": _serialize_overlay_bank(self.pipeline_b.overlay_input_bank),
@@ -2754,22 +2998,60 @@ class RinkaSoundBridgeWindow(QMainWindow):
             }
         }
 
+        # Tulis atomik: file sementara -> os.replace, sehingga crash/mati listrik di tengah
+        # penulisan tidak pernah meninggalkan config setengah jadi.
+        tmp_path = CONFIG_FILE + ".tmp"
         try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(config, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Backup hanya dari config lama yang masih valid (jangan menimpa .bak bagus dengan file rusak)
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, "r", encoding="utf-8") as f_old:
+                        json.load(f_old)
+                    shutil.copy2(CONFIG_FILE, CONFIG_FILE + ".bak")
+                except Exception:
+                    pass
+
+            os.replace(tmp_path, CONFIG_FILE)
         except Exception as e:
             rinka_logger.error(f"Error Auto-Save: {e}")
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _read_config_json():
+        """Baca config utama; jika rusak/hilang, coba backup .bak."""
+        for path in (CONFIG_FILE, CONFIG_FILE + ".bak"):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if path != CONFIG_FILE:
+                    rinka_logger.warning("Config utama rusak/hilang - memakai backup (.bak)")
+                return data
+            except Exception as e:
+                rinka_logger.error(f"Gagal membaca config {os.path.basename(path)}: {e}")
+        return None
 
     def load_config(self):
-        if not os.path.exists(CONFIG_FILE):
+        if not os.path.exists(CONFIG_FILE) and not os.path.exists(CONFIG_FILE + ".bak"):
             self.panel_line_a.on_device_changed()
             self.panel_line_b.on_device_changed()
             return
 
         self.is_loading_config = True
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                config = json.load(f)
+            config = self._read_config_json()
+            if config is None:
+                raise ValueError("config tidak dapat dibaca (utama maupun backup)")
 
             g_cfg = config.get("global", {})
             buf = g_cfg.get("buffer_size", 256)
@@ -2816,8 +3098,12 @@ class RinkaSoundBridgeWindow(QMainWindow):
             self.pipeline_b.buffer_size = buf
             self.pipeline_b.sample_rate = sr
 
-            self._restore_line(self.panel_line_a, config.get("line_a", {}))
-            self._restore_line(self.panel_line_b, config.get("line_b", {}))
+            # Per-Line: error di Line A tidak boleh membatalkan restore Line B
+            for panel, key in ((self.panel_line_a, "line_a"), (self.panel_line_b, "line_b")):
+                try:
+                    self._restore_line(panel, config.get(key, {}))
+                except Exception as line_err:
+                    rinka_logger.error(f"Error restore {key}: {line_err}")
 
         except Exception as e:
             rinka_logger.error(f"Error load config: {e}")
@@ -2844,6 +3130,8 @@ class RinkaSoundBridgeWindow(QMainWindow):
         in_name = data.get("input_device_name")
         out_name = data.get("output_device_name")
 
+        panel.desired_in_name = in_name
+        panel.desired_out_name = out_name
         panel.populate_inputs(select_device_name=in_name)
         panel.populate_outputs(select_device_name=out_name)
 
@@ -2932,6 +3220,12 @@ class RinkaSoundBridgeWindow(QMainWindow):
     def refresh_audio_devices(self):
         if self._is_refreshing_devices or self._is_shutting_down:
             return
+        if self.vst_editor_open:
+            QMessageBox.information(
+                self, "Editor VST Terbuka",
+                "Tutup jendela editor plugin terlebih dahulu sebelum me-refresh perangkat audio."
+            )
+            return
         self._is_refreshing_devices = True
         self.btn_refresh_devices.setEnabled(False)
         self.btn_refresh_devices.setText("⏳ Scanning...")
@@ -2939,10 +3233,11 @@ class RinkaSoundBridgeWindow(QMainWindow):
 
         try:
             # 1. Catat nama hardware audio yang sedang aktif dipilih saat ini
-            in_a_name = self.panel_line_a.cb_input.currentData()[1] if self.panel_line_a.cb_input.currentData() else None
-            out_a_name = self.panel_line_a.cb_output.currentData()[1] if self.panel_line_a.cb_output.currentData() else None
-            in_b_name = self.panel_line_b.cb_input.currentData()[1] if self.panel_line_b.cb_input.currentData() else None
-            out_b_name = self.panel_line_b.cb_output.currentData()[1] if self.panel_line_b.cb_output.currentData() else None
+            # (pakai nama pilihan user, bukan combobox, agar device yang sedang dicabut tetap diingat)
+            in_a_name = self.panel_line_a.desired_in_name
+            out_a_name = self.panel_line_a.desired_out_name
+            in_b_name = self.panel_line_b.desired_in_name
+            out_b_name = self.panel_line_b.desired_out_name
 
             # 2. Hentikan aliran stream aktif sesaat agar PortAudio bisa di-reinisialisasi
             self.pipeline_a.stop_stream()
@@ -2980,6 +3275,12 @@ class RinkaSoundBridgeWindow(QMainWindow):
             rinka_logger.info(f"Audio device berhasil di-refresh: {n_in} Input & {n_out} Output terdeteksi.")
         except Exception as e:
             rinka_logger.error(f"Gagal refresh audio device: {e}")
+            # Stream sudah dihentikan di awal; coba nyalakan lagi agar Line tidak mati sementara UI tampak ON
+            for panel in (self.panel_line_a, self.panel_line_b):
+                try:
+                    panel.on_device_changed()
+                except Exception as rec_err:
+                    rinka_logger.error(f"Gagal memulihkan {panel.title} setelah refresh: {rec_err}")
             QMessageBox.warning(self, "Peringatan", f"Gagal memperbarui daftar perangkat audio:\n{e}")
         finally:
             self.btn_refresh_devices.setText("🎧 REFRESH AUDIO DEVICE")
@@ -3001,43 +3302,64 @@ class RinkaSoundBridgeWindow(QMainWindow):
             self.latency_timer.stop()
         if hasattr(self, "vst_error_timer"):
             self.vst_error_timer.stop()
+        if hasattr(self, "stream_watchdog_timer"):
+            self.stream_watchdog_timer.stop()
         if hasattr(self, "perf_timer"):
             self.perf_timer.stop()
         if hasattr(self, "_save_debounce_timer"):
             self._save_debounce_timer.stop()
 
-        # 2. Simpan konfigurasi terakhir
-        try:
-            self.save_config_now()
-        except Exception as e:
-            rinka_logger.warning(f"Gagal save config saat shutdown: {e}")
-
-        # 3. Hentikan pipeline audio WASAPI
+        # 2. Hentikan pipeline audio WASAPI lebih dulu (plugin aman dibaca setelah stream berhenti)
         try:
             self.pipeline_a.stop_stream()
             self.pipeline_b.stop_stream()
         except Exception as e:
             rinka_logger.warning(f"Gagal stop stream saat shutdown: {e}")
 
-        # 4. Sembunyikan system tray
+        # 3. Jika aplikasi ditutup saat editor VST masih terbuka, tangkap parameter terakhirnya
+        #    agar perubahan yang belum sempat tersimpan tidak hilang.
+        if self.vst_editor_open:
+            for pipeline in (self.pipeline_a, self.pipeline_b):
+                for slot in list(pipeline.vst_slots):
+                    if slot.plugin is not None:
+                        try:
+                            slot.cached_params = capture_vst_parameters(slot.plugin)
+                        except Exception as cap_err:
+                            rinka_logger.warning(f"Gagal capture parameter '{slot.name}' saat shutdown: {cap_err}")
+
+        # 4. Simpan konfigurasi terakhir
+        try:
+            self.save_config_now()
+        except Exception as e:
+            rinka_logger.warning(f"Gagal save config saat shutdown: {e}")
+
+        # 5. Sembunyikan system tray
         try:
             if hasattr(self, "tray_icon"):
                 self.tray_icon.hide()
         except Exception:
             pass
 
-        # 5. Lepas koneksi PortAudio WASAPI
+        # 6. Lepas koneksi PortAudio WASAPI
         try:
             sd._terminate()
         except Exception:
             pass
 
+        # 7. Kosongkan antrean log & tutup file (log shutdown tidak boleh hilang)
+        rinka_logger.shutdown()
+
     def close_application(self):
         self.clean_shutdown()
         QApplication.quit()
-        sys.exit(0)
 
     def reload_application(self):
+        if self.vst_editor_open:
+            QMessageBox.information(
+                self, "Editor VST Terbuka",
+                "Tutup jendela editor plugin terlebih dahulu sebelum me-restart aplikasi."
+            )
+            return
         reply = QMessageBox.question(
             self, "Restart Aplikasi",
             "Aplikasi akan direstart bersih (audio engine dimatikan, file disimpan, "
@@ -3071,10 +3393,12 @@ class RinkaSoundBridgeWindow(QMainWindow):
                 f"Tidak bisa memulai ulang aplikasi secara otomatis:\n{e}\n\n"
                 "Silakan buka aplikasi kembali secara manual."
             )
+            # Audio engine & timer sudah dimatikan oleh clean_shutdown(); aplikasi tidak boleh
+            # dibiarkan hidup dalam keadaan setengah mati, jadi keluar dengan bersih.
+            QApplication.quit()
             return
 
         QApplication.quit()
-        sys.exit(0)
 
     def closeEvent(self, event):
         self.clean_shutdown()

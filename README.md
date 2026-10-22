@@ -6,6 +6,11 @@
 
 ## 📸 Screenshots & Interface Preview
 
+![](assets/preview_1.png)
+
+![](assets/preview_2.png)
+
+![](assets/preview_3.png)
 
 ## 🚀 What Changed from v1.22 to v2.0? (Major Architectural Leap)
 

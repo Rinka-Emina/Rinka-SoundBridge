@@ -26,9 +26,11 @@
 > 
 > You need lock your GPU clock to boost speed, on RTX 3080 12gb i got 350ms-ish, on my Laptop RTX 3070 8gb it reaches 400ms-ish with streaming + Vtube Studio + Chrome open play Youtube.
 > 
-> my setting is set low as Vonovox GPU Delay : "VALUE". Mode 4, Extra Buffer: 0 , Base Cushion Flor: 30ms, Stall Multiplier: 1.05x.
+> my setting is set low as Vonovox GPU Delay : "VALUE". Mode 4, Extra Buffer: 0 , Base Cushion Flor: 25ms, Stall Multiplier: 1.05x.
 > 
 > PLEASE CHECK YOUR Vonovox GPU Delay : "VALUE" while gaming, make sure it not spiking a lot.
+>
+> Also on Driver : WASAPI Shared, i got around 500ms -ish, it that fast if you lock your GPU Clock to boost, if not it will be around 800ms -ish and will not able to use SoundBridge ASIO, since Vonovox GPU Delay will spiking a lot from 20 to 190 make your audio stutter like crazy
 
 
 

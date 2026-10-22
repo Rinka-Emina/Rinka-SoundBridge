@@ -62,7 +62,7 @@ Rinka SoundBridge v2.0 completely retires the v1.22 codebase and introduces a na
 ### 2. Dual-Line VST3 Host (`Line A` & `Line B`)
 - **Pre-Processing (`Line A`) & Post-Processing (`Line B`)**: Run Noise Gates, RNNoise, De-Essers, Compressors, and EQ on `Line A` *before* your voice enters the AI Voice Changer (so the RVC pitch tracker receives a clean signal), and run Reverb, Stereo Enhancers, or Mastering Limiters on `Line B` *after* voice conversion.
 - **100% Bit-Exact 32-Bit Float Headroom**: Pre- and post-VST stages preserve full floating-point dynamic range (`-12 dBFS` to `+11.9 dBFS` untouched), with a 64-bit `5.0 Hz` DC Blocker and a stereo-linked C2-continuous `0.995` (`-0.043 dBFS`) final DAC safety limiter.
-- **Fail-Closed Safety Protection (`Mode Aman`)**: Automatically catches any VST3 plugin crash or `NaN`/`Inf` runaway fault and mutes the affected block cleanly without crashing the host or popping your headphones.
+- **Fail-Closed Safety Protection (`Safe Mode`)**: Automatically catches any VST3 plugin crash or `NaN`/`Inf` runaway fault and mutes the affected block cleanly without crashing the host or popping your headphones.
 - **State Persistence**: Saves and restores full VST3 binary component/controller states (`hex`) and parameter snapshots automatically in `Savedata\rinka_soundbridge_config.json`.
 
 ### 3. Built-in Audio Overlays & Live2D Lip-Sync Delay Meter

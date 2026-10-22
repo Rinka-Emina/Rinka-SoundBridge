@@ -79,6 +79,8 @@ When using GPU-heavy AI Voice Changers (**Vonovox / RVC / PyTorch / ONNX**), voi
 2. **Optional Built-in GPU Boost Clock Lock (Fallback)**:
    - Rinka SoundBridge v2.0 also includes an optional built-in NVML GPU Boost Clock Lock inside the ASIO Settings window (hidden by default behind **`"▸ Show Built-in GPU Boost Clock Lock"`**).
    - It uses your GPU's factory VBIOS boost ceiling (zero overclocking), monitors live MHz and temperature (`°C`) every 1 second, automatically unlocks if GPU temperature reaches `>= 83°C`, and guarantees automatic unlock when Rinka SoundBridge closes.
+     
+   - DO NOT USE UNLESS YOU NEEDED IT ONLY, PLEASE USE 3rd PARTY SOFTWARE LIKE EVGA  PRECISION X1
 
 ## 🛠️ How to Build & Run
 
@@ -90,7 +92,7 @@ When using GPU-heavy AI Voice Changers (**Vonovox / RVC / PyTorch / ONNX**), voi
 ### One-Click Build & Registration
 1. Right-click **`build.bat`** and select **Run as administrator**.
 2. `build.bat` automatically compiles both `rinka_soundbridge_core.dll` (the Virtual ASIO COM driver) and `RinkaSoundBridge.exe` in `--release` mode, assembles the `dist\` directory, and registers `"RSB ASIO"` and `"Rinka SoundBridge ASIO"` in the Windows Registry.
-3. Launch **`dist\RinkaSoundBridge.exe`** (or double-click **`test.bat`**).
+3. Launch **`dist\RinkaSoundBridge.exe`**.
 
 ### Output Directory Structure (`dist\`)
 ```text

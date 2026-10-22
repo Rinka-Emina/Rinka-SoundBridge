@@ -22,7 +22,7 @@
 ![](assets/preview_4.png)
 > [!NOTE]
 > **Personal Message:**  
-> From my testing, if not using VST, its capable reach lowest at **350 ms -ish** delay, with Vonovox v2.0 and 0.20 chunk that run on Driver: SoundBridge ASIO.
+> From my testing, if not using VST, its capable reach lowest at **350 ms -ish** delay, with Vonovox v2.0 and **0.20** block size that run on Driver: SoundBridge ASIO.
 > 
 > You need lock your GPU clock to boost speed, on RTX 3080 12gb i got 350ms-ish, on my Laptop RTX 3070 8gb it reaches 400ms-ish with streaming + Vtube Studio + Chrome open play Youtube.
 > 

@@ -41,7 +41,7 @@ Rinka SoundBridge v2.0 completely retires the v1.22 codebase and introduces a na
 | Aspect / Feature | Legacy v1.22 | New Rinka SoundBridge v2.0 (Rust Native) |
 | :--- | :--- | :--- |
 | **Core Language & Runtime** | Python interpreter (subject to GIL contention and garbage collection pauses) | **100% Native Rust (`x86_64-pc-windows-msvc`)** + Native Win32 COM DLL (`rinka_soundbridge_core.dll`) |
-| **Memory & CPU Footprint** | High RAM usage (`~180–350 MB`) and higher idle CPU overhead | **Ultra-lightweight (`~25–45 MB RAM`, `< 1%` idle CPU)** with `eframe`/`egui` GPU-rendered UI |
+| **Memory & CPU Footprint** | High RAM usage (`~180–350 MB`) and higher idle CPU overhead Note: More VST More Memory | **Ultra-lightweight (`~25–45 MB RAM`, `< 1%` idle CPU)** with `eframe`/`egui` GPU-rendered UI Note: More VST More Memory|
 | **Real-Time Audio Thread Safety** | Dynamic buffer allocations during audio callbacks | **100% Zero-Heap-Allocation (`AudioScratchBuffers`)** + MMCSS `"Pro Audio"` thread priority & CPU core affinity |
 | **Audio Signal Path Quality** | Standard float conversion with intermediate soft-clipping | **100% Bit-Exact 32-Bit IEEE Float Pass-Through**, 64-bit `5.0 Hz` Sub-Sonic DC Blocker, and `0.995` (`-0.043 dBFS`) True-Peak Mastering Limiter |
 | **Virtual Cable & FlexASIO Dependency** | Required external Virtual Audio Cables + external FlexASIO installation | **2 Built-in Virtual ASIO Drivers (`"RSB ASIO"` & `"Rinka SoundBridge ASIO"`)** with direct in-memory SPSC loopback (no external FlexASIO or Virtual Cable required) |

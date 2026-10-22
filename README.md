@@ -49,6 +49,7 @@ Rinka SoundBridge v2.0 completely retires the v1.22 codebase and introduces a na
 | **WASAPI Shared Engine** | Standard polling (`~30–45 ms` per line) | **Direct 10 ms Event-Driven COM `IAudioClient`** (bypasses Windows SRC APO when sample rates match, cutting latency by `~45%`) |
 | **Live2D / VTube Studio Sync** | Manual estimation | **Real-Time FFT Onset Cross-Correlation Delay Meter (`In A -> Out B`)** displaying exact milliseconds for Live2D lip-sync calibration |
 | **GPU Clock Stability Support** | None | **GPU Boost Clock Lock Integration** (Live MHz/°C telemetry, 3rd-party lock guidance, and optional hidden-by-default built-in NVML lock with thermal failsafe) |
+| **Executable file size** | Around ~50mb | **now it around ~8mb** |
 
 ## ✨ Core Features in v2.0
 

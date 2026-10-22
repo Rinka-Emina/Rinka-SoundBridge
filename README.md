@@ -6,27 +6,6 @@
 
 ## 📸 Screenshots & Interface Preview
 
-> **Note for Repository Owner:** Replace the image paths below (`assets/preview_1.png`, `assets/preview_2.png`, `assets/preview_3.png`, `assets/preview_4.png`) with your uploaded screenshot URLs or repository image files.
-
-### Image Preview 1 — Main Dual-Pipeline Dashboard (`Line A` & `Line B` + Live2D Delay Meter)
-
-![Image Preview 1 - Main Dashboard](assets/preview_1.png)
-*Main interface showing Line A (Microphone Input & Pre-VC VST3 Chain), Line B (Voice Changer Output & Post-VC VST3 Chain), real-time CPU/RAM monitor, and the Live2D / VTube Studio Lip-Sync Delay Meter (`In A -> Out B`).*
-
-### Image Preview 2 — `Rsb ASIO (Experimental)` (Built-in FlexASIO GUI v0.35)
-
-![Image Preview 2 - Rsb ASIO Built-in FlexASIO GUI](assets/preview_2.png)
-*Built-in FlexASIO GUI (`"RSB ASIO"`) with `Auto-Sync Buffer Size with RSB`, direct hardware-event-driven SPSC routing without external Virtual Audio Cables, and live `FlexASIO.toml` preview.*
-
-### Image Preview 3 — `SoundBridge ASIO (Experimental)` (Adaptive GPU Cushion Modes 1–5)
-
-![Image Preview 3 - SoundBridge ASIO Adaptive Engine](assets/preview_3.png)
-*Configurable Adaptive GPU Stall Cushion window (`"Rinka SoundBridge ASIO"`) featuring 5 real-time GPU sensor modes (Default: Mode 4 Hybrid Dual-Sensor), manual extra buffer (`+ms`), and performance notes.*
-
-### Image Preview 4 — Native 64-Bit VST3 Plugin Chain & Editor Hosting
-
-![Image Preview 4 - VST3 Plugin Chain](assets/preview_4.png)
-*Zero-allocation VST3 hosting supporting FabFilter, Waves, iZotope, RNNoise, and TDR plugins with native floating GUI editors, per-slot microsecond DSP load meters, and instant bypass/reorder.*
 
 ## 🚀 What Changed from v1.22 to v2.0? (Major Architectural Leap)
 

@@ -1,0 +1,157 @@
+{
+  "global": {
+    "buffer_size": 256,
+    "sample_rate": 48000,
+    "window_geometry": null,
+    "window_x": null,
+    "window_y": null,
+    "window_w": 1020,
+    "window_h": 940,
+    "theme": "Windows 11 Dark",
+    "fifo_mode": "adaptive",
+    "audio_priority": true,
+    "show_delay_bar": true,
+    "sync_triple_asio": true,
+    "asio_set_in_enabled": false,
+    "asio_set_in_latency": 0.0,
+    "asio_set_out_enabled": false,
+    "asio_set_out_latency": 0.0
+  },
+  "line_a": {
+    "is_enabled": true,
+    "driver_mode": "wasapi_shared",
+    "input_device_name": null,
+    "output_device_name": null,
+    "asio_driver_name": null,
+    "asio_exp_in_samples": 256,
+    "asio_exp_out_samples": 256,
+    "master_volume": 100,
+    "is_muted": false,
+    "fail_closed": true,
+    "dc_blocker": true,
+    "overlay_input": [
+      {
+        "enabled": false,
+        "file_path": null,
+        "gain": 0.5
+      }
+    ],
+    "overlay_output": [
+      {
+        "enabled": false,
+        "file_path": null,
+        "gain": 0.5
+      }
+    ],
+    "vst_slots": []
+  },
+  "line_b": {
+    "is_enabled": true,
+    "driver_mode": "wasapi_shared",
+    "input_device_name": null,
+    "output_device_name": null,
+    "asio_driver_name": null,
+    "asio_exp_in_samples": 256,
+    "asio_exp_out_samples": 256,
+    "master_volume": 100,
+    "is_muted": false,
+    "fail_closed": true,
+    "dc_blocker": true,
+    "overlay_input": [
+      {
+        "enabled": false,
+        "file_path": null,
+        "gain": 0.5
+      }
+    ],
+    "overlay_output": [
+      {
+        "enabled": false,
+        "file_path": null,
+        "gain": 0.5
+      }
+    ],
+    "vst_slots": []
+  },
+  "asio_line_a": {
+    "input_device": "",
+    "output_device": "",
+    "buffer_size": 256,
+    "set_in_latency_enabled": false,
+    "in_latency_val": 0.0,
+    "set_out_latency_enabled": false,
+    "out_latency_val": 0.0,
+    "wasapi_in_set": true,
+    "wasapi_in_exclusive": false,
+    "wasapi_in_autoconvert": true,
+    "wasapi_out_set": true,
+    "wasapi_out_exclusive": false,
+    "wasapi_out_autoconvert": true,
+    "in_channels": 0,
+    "out_channels": 0
+  },
+  "asio_line_b": {
+    "input_device": "",
+    "output_device": "",
+    "buffer_size": 256,
+    "set_in_latency_enabled": false,
+    "in_latency_val": 0.0,
+    "set_out_latency_enabled": false,
+    "out_latency_val": 0.0,
+    "wasapi_in_set": true,
+    "wasapi_in_exclusive": false,
+    "wasapi_in_autoconvert": true,
+    "wasapi_out_set": true,
+    "wasapi_out_exclusive": false,
+    "wasapi_out_autoconvert": true,
+    "in_channels": 0,
+    "out_channels": 0
+  },
+  "asio_vc": {
+    "input_device": "",
+    "output_device": "",
+    "buffer_size": 256,
+    "set_in_latency_enabled": false,
+    "in_latency_val": 0.0,
+    "set_out_latency_enabled": false,
+    "out_latency_val": 0.0,
+    "wasapi_in_set": true,
+    "wasapi_in_exclusive": false,
+    "wasapi_in_autoconvert": true,
+    "wasapi_out_set": true,
+    "wasapi_out_exclusive": false,
+    "wasapi_out_autoconvert": true,
+    "in_channels": 0,
+    "out_channels": 0
+  },
+  "asio_dsp_rsb": {
+    "sync_buffer_size_with_rsb": true,
+    "manual_buffer_size": 256,
+    "sync_sample_rate_with_rsb": true,
+    "manual_sample_rate": 48000,
+    "buffer_size": 256,
+    "adaptive_cushion": true,
+    "adaptive_mode": "hybrid_dual_fusion",
+    "dsp_b_cushion_ms": 60.0,
+    "adaptive_extra_ms": 25.0,
+    "gpu_stall_multiplier": 1.15,
+    "micro_stretch_rescue": true,
+    "adaptive_reported_latency": true,
+    "reported_in_ms": 304.0,
+    "reported_out_ms": 16.0,
+    "asio_cpu_cores": 2,
+    "cpu_cores_user_configured": true,
+    "set_in_latency_enabled": false,
+    "in_latency_val": 0.0,
+    "wasapi_in_set": true,
+    "wasapi_in_exclusive": false,
+    "wasapi_in_autoconvert": true,
+    "in_channels": 0,
+    "set_out_latency_enabled": false,
+    "out_latency_val": 0.0,
+    "wasapi_out_set": true,
+    "wasapi_out_exclusive": false,
+    "wasapi_out_autoconvert": true,
+    "out_channels": 0
+  }
+}

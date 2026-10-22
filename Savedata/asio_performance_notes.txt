@@ -1,0 +1,3 @@
+⚠️ PENTING / RECOMMENDED: Gunakan aplikasi pihak ke-3 (seperti MSI Afterburner atau EVGA Precision X1) untuk melakukan Lock GPU Boost Clock dibanding fitur Built-in GPU Boost Lock di atas; fitur Built-in Lock hanya disediakan sebagai cadangan jika diperlukan.
+💡 PERFORMANCE & LOW-LATENCY TIP (AI Voice Changer / Vonovox / RVC):
+Mengunci frekuensi GPU Boost Clock (mis. melalui MSI Afterburner / EVGA Precision X1) mencegah penurunan frekuensi (P-state downclocking) di sela-sela chunk suara 200-300 ms, sehingga GPU Delay tetap rata/stabil dan kualitas suara real-time 100% bebas stutter.

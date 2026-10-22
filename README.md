@@ -17,6 +17,16 @@
 
 ![](assets/preview_3.png)
 
+![](assets/preview_4.png)
+> [!NOTE]
+> **Personal Message:**  
+> From my testing, if not using VST, its capable reach lowest at **350 ms -ish** delay, with Vonovox v2.0 and 0.20 chunk that run on Driver: SoundBridge ASIO
+> You need lock your GPU clock to boost speed, on RTX 3080 12gb i got 350ms-ish, on my Laptop RTX 3070 8gb it reaches 400ms-ish with streaming + Vtube Studio + Chrome open play Youtube
+> my setting is set low as Vonovox GPU Delay : "VALUE". Mode 4, Extra Buffer: 0 , Base Cushion Flor: 30ms, Stall Multiplier: 1.05x
+> PLEASE CHECK YOUR Vonovox GPU Delay : "VALUE" while gaming, make sure it not spiking a lot
+
+
+
 ## 🚀 What Changed from v1.22 to v2.0? (Major Architectural Leap)
 
 Rinka SoundBridge v2.0 completely retires the v1.22 codebase and introduces a native systems-level audio architecture:

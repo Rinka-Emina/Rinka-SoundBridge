@@ -7,7 +7,7 @@ Dual-Pipeline VST3 Host, Audio Router & Built-in Virtual ASIO Bridge for AI Voic
 > [!NOTE]
 > **Project Note & Disclaimer:**  
 > This software was originally developed independently with the assistance of AI to solve my own personal audio routing and voice changer pipeline needs (rather than pirating commercial software or juggling two separate applications). This repository is shared openly (*as-is*) for anyone who might find it useful, just in case.  
-> If anyone in the community wishes to take it further, fork it, or build upon it, please feel free—in fact, I'd be genuinely thrilled to see someone develop it further rather than relying on this AI-assisted result. This application was built solely to address my own personal use case.
+> If anyone in the community wishes to take it further, fork it, or build upon it, please feel free—in fact, I'd be genuinely happy to see someone develop it further rather than relying on this AI-assisted result. This application was built solely to address my own personal use case.
 
 ## 📸 Screenshots & Interface Preview
 

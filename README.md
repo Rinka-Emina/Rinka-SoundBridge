@@ -4,6 +4,11 @@ Dual-Pipeline VST3 Host, Audio Router & Built-in Virtual ASIO Bridge for AI Voic
 
 **Rinka SoundBridge v2.0** is a complete ground-up rewrite of Rinka SoundBridge in **100% Native Rust (`x86_64-pc-windows-msvc`)**. Engineered for real-time voice processing, VTubing (**Live2D / VTube Studio**), live broadcasting (**OBS Studio / Discord**), and GPU-accelerated AI Voice Changers (**Vonovox / RVC / OKADA**), v2.0 replaces the legacy v1.22 Python architecture with a zero-allocation real-time audio engine and two built-in COM Virtual ASIO drivers (`rinka_soundbridge_core.dll`).
 
+> [!NOTE]
+> **Project Note & Disclaimer:**  
+> This software was originally developed independently with the assistance of AI to solve my own personal audio routing and voice changer pipeline needs (rather than pirating commercial software or juggling two separate applications). This repository is shared openly (*as-is*) for anyone who might find it useful, just in case.  
+> If anyone in the community wishes to take it further, fork it, or build upon it, please feel free—in fact, I'd be genuinely thrilled to see someone develop it further rather than relying on this AI-assisted result. This application was built solely to address my own personal use case.
+
 ## 📸 Screenshots & Interface Preview
 
 ![](assets/preview_1.png)

@@ -55,6 +55,77 @@ pub const AUDCLNT_SHAREMODE_EXCLUSIVE: u32 = 1;
 pub const AUDCLNT_STREAMFLAGS_EVENTCALLBACK: u32 = 0x00040000;
 pub const AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x80000000;
 pub const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x08000000;
+pub const AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED: i32 = 0x8889_0019u32 as i32;
+
+const STGM_READ: u32 = 0;
+const VT_LPWSTR: u16 = 31;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PROPERTYKEY {
+    fmtid: ffi::GUID,
+    pid: u32,
+}
+
+const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
+    fmtid: ffi::GUID {
+        data1: 0xA45C254E,
+        data2: 0xDF1C,
+        data3: 0x4EFD,
+        data4: [0x80, 0x20, 0x67, 0xD1, 0x46, 0xA8, 0x50, 0xE0],
+    },
+    pid: 14,
+};
+
+#[repr(C)]
+struct PROPVARIANT {
+    vt: u16,
+    reserved1: u16,
+    reserved2: u16,
+    reserved3: u16,
+    ptr_val: *mut c_void,
+    pad: usize,
+}
+
+#[cfg(windows)]
+#[link(name = "ole32")]
+extern "system" {
+    fn PropVariantClear(pvar: *mut PROPVARIANT) -> i32;
+}
+
+#[repr(C)]
+struct IPropertyStoreVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const ffi::GUID, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    get_count: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+    get_at: unsafe extern "system" fn(*mut c_void, u32, *mut PROPERTYKEY) -> i32,
+    get_value: unsafe extern "system" fn(*mut c_void, *const PROPERTYKEY, *mut PROPVARIANT) -> i32,
+}
+
+#[derive(Clone, Debug)]
+pub enum WasapiEndpointTarget {
+    ByName(String),
+    ByIndex(usize),
+}
+
+impl From<String> for WasapiEndpointTarget {
+    fn from(s: String) -> Self {
+        Self::ByName(s)
+    }
+}
+
+impl From<&str> for WasapiEndpointTarget {
+    fn from(s: &str) -> Self {
+        Self::ByName(s.to_string())
+    }
+}
+
+impl From<usize> for WasapiEndpointTarget {
+    fn from(idx: usize) -> Self {
+        Self::ByIndex(idx)
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -98,6 +169,186 @@ pub struct IMMDeviceVtbl {
         *mut c_void,
         *mut *mut c_void,
     ) -> i32,
+    pub open_property_store: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
+    pub get_id: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> i32,
+}
+
+#[cfg(windows)]
+unsafe fn read_mmdevice_friendly_name(device: *mut c_void) -> Option<String> {
+    let dev_vtbl = &**(device as *mut *const IMMDeviceVtbl);
+    let mut store: *mut c_void = ptr::null_mut();
+    if (dev_vtbl.open_property_store)(device, STGM_READ, &mut store) < 0 || store.is_null() {
+        return None;
+    }
+    let store_vtbl = &**(store as *mut *const IPropertyStoreVtbl);
+    let mut pv: PROPVARIANT = std::mem::zeroed();
+    let hr = (store_vtbl.get_value)(store, &PKEY_DEVICE_FRIENDLY_NAME, &mut pv);
+    let mut out = None;
+    if hr >= 0 && pv.vt == VT_LPWSTR && !pv.ptr_val.is_null() {
+        let wptr = pv.ptr_val as *const u16;
+        let mut len = 0usize;
+        while len < 1024 && *wptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(wptr, len);
+        out = Some(String::from_utf16_lossy(slice));
+    }
+    let _ = PropVariantClear(&mut pv);
+    (store_vtbl.release)(store);
+    out
+}
+
+/// Resolves an active Windows MMDevice endpoint by exact/case-insensitive friendly name
+/// (avoiding cpal `eAll` filter-shift & hot-plug index mismatches) or legacy numeric index.
+#[cfg(windows)]
+unsafe fn open_mmdevice(target: &WasapiEndpointTarget, is_capture: bool) -> Result<*mut c_void, String> {
+    let mut enumerator: *mut c_void = ptr::null_mut();
+    let hr = ffi::CoCreateInstance(
+        &CLSID_MMDEVICE_ENUMERATOR,
+        ptr::null_mut(),
+        ffi::CLSCTX_ALL,
+        &IID_IMMDEVICE_ENUMERATOR,
+        &mut enumerator,
+    );
+    if hr < 0 || enumerator.is_null() {
+        return Err(format!("IMMDeviceEnumerator gagal (0x{:08X})", hr));
+    }
+    let enum_vtbl = &**(enumerator as *mut *const IMMDeviceEnumeratorVtbl);
+    // data_flow: 0 = eRender (Output), 1 = eCapture (Input); state_mask: 1 = DEVICE_STATE_ACTIVE
+    let data_flow = if is_capture { 1 } else { 0 };
+    let mut collection: *mut c_void = ptr::null_mut();
+    if (enum_vtbl.enum_audio_endpoints)(enumerator, data_flow, 1, &mut collection) < 0 || collection.is_null() {
+        (enum_vtbl.release)(enumerator);
+        return Err("EnumAudioEndpoints gagal".into());
+    }
+    let col_vtbl = &**(collection as *mut *const IMMDeviceCollectionVtbl);
+
+    let result = match target {
+        WasapiEndpointTarget::ByIndex(idx) => {
+            let mut device: *mut c_void = ptr::null_mut();
+            if (col_vtbl.item)(collection, *idx as u32, &mut device) < 0 || device.is_null() {
+                Err("Device index not found in IMMDeviceCollection".into())
+            } else {
+                Ok(device)
+            }
+        }
+        WasapiEndpointTarget::ByName(want_name) => {
+            let mut count: u32 = 0;
+            if (col_vtbl.get_count)(collection, &mut count) < 0 {
+                Err("IMMDeviceCollection::GetCount failed".into())
+            } else {
+                let mut exact_dev: *mut c_void = ptr::null_mut();
+                let mut ci_dev: *mut c_void = ptr::null_mut();
+                for i in 0..count {
+                    let mut dev: *mut c_void = ptr::null_mut();
+                    if (col_vtbl.item)(collection, i, &mut dev) < 0 || dev.is_null() {
+                        continue;
+                    }
+                    let fname = read_mmdevice_friendly_name(dev);
+                    if let Some(ref f) = fname {
+                        if f == want_name {
+                            exact_dev = dev;
+                            break;
+                        }
+                        if ci_dev.is_null() && f.eq_ignore_ascii_case(want_name) {
+                            ci_dev = dev;
+                            continue;
+                        }
+                    }
+                    let dev_vtbl = &**(dev as *mut *const IMMDeviceVtbl);
+                    (dev_vtbl.release)(dev);
+                }
+                if !exact_dev.is_null() {
+                    if !ci_dev.is_null() {
+                        let v = &**(ci_dev as *mut *const IMMDeviceVtbl);
+                        (v.release)(ci_dev);
+                    }
+                    Ok(exact_dev)
+                } else if !ci_dev.is_null() {
+                    Ok(ci_dev)
+                } else {
+                    Err(format!("WASAPI endpoint '{}' not found in active MMDeviceCollection", want_name))
+                }
+            }
+        }
+    };
+
+    (col_vtbl.release)(collection);
+    (enum_vtbl.release)(enumerator);
+    result
+}
+
+#[cfg(windows)]
+unsafe fn activate_audio_client_from_device(device: *mut c_void) -> Result<*mut c_void, String> {
+    let dev_vtbl = &**(device as *mut *const IMMDeviceVtbl);
+    let mut client: *mut c_void = ptr::null_mut();
+    let act_hr = (dev_vtbl.activate)(
+        device,
+        &IID_IAUDIOCLIENT,
+        ffi::CLSCTX_ALL,
+        ptr::null_mut(),
+        &mut client,
+    );
+    if act_hr < 0 || client.is_null() {
+        return Err(format!("IAudioClient::Activate failed (0x{:08X})", act_hr));
+    }
+    Ok(client)
+}
+
+/// Attempts Exclusive Event-Driven `IAudioClient::Initialize` handling `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`
+/// by querying the hardware-aligned buffer size and re-activating a fresh `IAudioClient`.
+#[cfg(windows)]
+unsafe fn try_init_exclusive_aligned(
+    device: *mut c_void,
+    client: &mut *mut c_void,
+    wfx: &WAVEFORMATEX,
+    period_hns: i64,
+) -> i32 {
+    if client.is_null() {
+        match activate_audio_client_from_device(device) {
+            Ok(c) => *client = c,
+            Err(_) => return -1,
+        }
+    }
+    let cli_vtbl = &**(*client as *mut *const IAudioClientVtbl);
+    let hr = (cli_vtbl.initialize)(
+        *client,
+        AUDCLNT_SHAREMODE_EXCLUSIVE,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+        period_hns,
+        period_hns,
+        wfx,
+        ptr::null(),
+    );
+    if hr != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED {
+        return hr;
+    }
+    // Hardware requested a specific aligned buffer size (Microsoft WASAPI Exclusive specification)
+    let mut aligned_frames: u32 = 0;
+    let gbs_hr = (cli_vtbl.get_buffer_size)(*client, &mut aligned_frames);
+    (cli_vtbl.release)(*client);
+    *client = ptr::null_mut();
+    if gbs_hr < 0 || aligned_frames == 0 || wfx.nSamplesPerSec == 0 {
+        return hr;
+    }
+    let aligned_period =
+        ((10_000_000.0 * (aligned_frames as f64) / (wfx.nSamplesPerSec as f64)) + 0.5) as i64;
+    match activate_audio_client_from_device(device) {
+        Ok(fresh) => {
+            *client = fresh;
+            let v2 = &**(fresh as *mut *const IAudioClientVtbl);
+            (v2.initialize)(
+                fresh,
+                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                aligned_period,
+                aligned_period,
+                wfx,
+                ptr::null(),
+            )
+        }
+        Err(_) => -1,
+    }
 }
 
 #[repr(C)]
@@ -156,6 +407,8 @@ pub struct WasapiExclusivePair {
     in_thread: Option<JoinHandle<()>>,
     out_thread: Option<JoinHandle<()>>,
     pub active_sample_rate: u32,
+    pub active_in_buf_frames: u32,
+    pub active_out_buf_frames: u32,
 }
 
 unsafe impl Send for WasapiExclusivePair {}
@@ -164,8 +417,8 @@ unsafe impl Sync for WasapiExclusivePair {}
 impl WasapiExclusivePair {
     /// Coba buka perangkat Input & Output dalam mode WASAPI Exclusive (Event-Driven).
     pub fn try_start<FIn, FOut>(
-        in_idx: usize,
-        out_idx: usize,
+        in_target: impl Into<WasapiEndpointTarget>,
+        out_target: impl Into<WasapiEndpointTarget>,
         sample_rate: u32,
         buffer_size: u32,
         mut in_cb: FIn,
@@ -175,11 +428,13 @@ impl WasapiExclusivePair {
         FIn: FnMut(&[f32], usize, usize) + Send + 'static,
         FOut: FnMut(&mut [f32], usize, usize) + Send + 'static,
     {
+        let in_target = in_target.into();
+        let out_target = out_target.into();
         #[cfg(windows)]
         {
             let stop_flag = Arc::new(AtomicBool::new(false));
-            let (in_ready_tx, in_ready_rx) = std::sync::mpsc::sync_channel::<Result<u32, String>>(1);
-            let (out_ready_tx, out_ready_rx) = std::sync::mpsc::sync_channel::<Result<u32, String>>(1);
+            let (in_ready_tx, in_ready_rx) = std::sync::mpsc::sync_channel::<Result<(u32, u32), String>>(1);
+            let (out_ready_tx, out_ready_rx) = std::sync::mpsc::sync_channel::<Result<(u32, u32), String>>(1);
 
             let stop_in = Arc::clone(&stop_flag);
             let in_thread = thread::Builder::new()
@@ -187,7 +442,7 @@ impl WasapiExclusivePair {
                 .spawn(move || {
                     run_exclusive_endpoint(
                         true,
-                        in_idx,
+                        in_target,
                         sample_rate,
                         buffer_size,
                         stop_in,
@@ -198,8 +453,8 @@ impl WasapiExclusivePair {
                 })
                 .map_err(|e| e.to_string())?;
 
-            let in_sr = match in_ready_rx.recv() {
-                Ok(Ok(sr)) => sr,
+            let (in_sr, in_buf_frames) = match in_ready_rx.recv() {
+                Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     stop_flag.store(true, Ordering::SeqCst);
                     let _ = in_thread.join();
@@ -218,7 +473,7 @@ impl WasapiExclusivePair {
                 .spawn(move || {
                     run_exclusive_endpoint(
                         false,
-                        out_idx,
+                        out_target,
                         in_sr,
                         buffer_size,
                         stop_out,
@@ -230,11 +485,13 @@ impl WasapiExclusivePair {
                 .map_err(|e| e.to_string())?;
 
             match out_ready_rx.recv() {
-                Ok(Ok(_)) => Ok(Self {
+                Ok(Ok((_, out_buf_frames))) => Ok(Self {
                     stop_flag,
                     in_thread: Some(in_thread),
                     out_thread: Some(out_thread),
                     active_sample_rate: in_sr,
+                    active_in_buf_frames: in_buf_frames,
+                    active_out_buf_frames: out_buf_frames,
                 }),
                 Ok(Err(e)) => {
                     stop_flag.store(true, Ordering::SeqCst);
@@ -252,7 +509,7 @@ impl WasapiExclusivePair {
         }
         #[cfg(not(windows))]
         {
-            let _ = (in_idx, out_idx, sample_rate, buffer_size, &mut in_cb, &mut out_cb);
+            let _ = (in_target, out_target, sample_rate, buffer_size, &mut in_cb, &mut out_cb);
             Err("WASAPI Exclusive is only available on Windows".into())
         }
     }
@@ -274,11 +531,11 @@ impl Drop for WasapiExclusivePair {
 #[allow(clippy::too_many_arguments)]
 fn run_exclusive_endpoint<FIn, FOut>(
     is_capture: bool,
-    dev_idx: usize,
+    target: WasapiEndpointTarget,
     requested_sr: u32,
     requested_frames: u32,
     stop_flag: Arc<AtomicBool>,
-    ready_tx: std::sync::mpsc::SyncSender<Result<u32, String>>,
+    ready_tx: std::sync::mpsc::SyncSender<Result<(u32, u32), String>>,
     mut in_cb: FIn,
     mut out_cb: FOut,
 ) where
@@ -286,66 +543,44 @@ fn run_exclusive_endpoint<FIn, FOut>(
     FOut: FnMut(&mut [f32], usize, usize),
 {
     unsafe {
-        let _ = ffi::CoInitializeEx(ptr::null_mut(), ffi::COINIT_MULTITHREADED);
+        let hr_com = ffi::CoInitializeEx(ptr::null_mut(), ffi::COINIT_MULTITHREADED);
+        let com_ours = hr_com == 0 || hr_com == 1;
         let _ = boost_audio_thread();
+        let cleanup_com = |ours: bool| {
+            if ours {
+                ffi::CoUninitialize();
+            }
+        };
 
-        let mut enumerator: *mut c_void = ptr::null_mut();
-        let hr = ffi::CoCreateInstance(
-            &CLSID_MMDEVICE_ENUMERATOR,
-            ptr::null_mut(),
-            ffi::CLSCTX_ALL,
-            &IID_IMMDEVICE_ENUMERATOR,
-            &mut enumerator,
-        );
-        if hr < 0 || enumerator.is_null() {
-            let _ = ready_tx.send(Err(format!("IMMDeviceEnumerator gagal (0x{:08X})", hr)));
-            ffi::CoUninitialize();
-            return;
-        }
-        let enum_vtbl = &**(enumerator as *mut *const IMMDeviceEnumeratorVtbl);
-
-        // data_flow: 0 = eRender (Output), 1 = eCapture (Input); state_mask: 1 = DEVICE_STATE_ACTIVE
-        let data_flow = if is_capture { 1 } else { 0 };
-        let mut collection: *mut c_void = ptr::null_mut();
-        if (enum_vtbl.enum_audio_endpoints)(enumerator, data_flow, 1, &mut collection) < 0 || collection.is_null() {
-            (enum_vtbl.release)(enumerator);
-            let _ = ready_tx.send(Err("EnumAudioEndpoints gagal".into()));
-            ffi::CoUninitialize();
-            return;
-        }
-        let col_vtbl = &**(collection as *mut *const IMMDeviceCollectionVtbl);
-        let mut device: *mut c_void = ptr::null_mut();
-        if (col_vtbl.item)(collection, dev_idx as u32, &mut device) < 0 || device.is_null() {
-            (col_vtbl.release)(collection);
-            (enum_vtbl.release)(enumerator);
-            let _ = ready_tx.send(Err("Device index not found in IMMDeviceCollection".into()));
-            ffi::CoUninitialize();
-            return;
-        }
-        (col_vtbl.release)(collection);
-        (enum_vtbl.release)(enumerator);
-
+        let device = match open_mmdevice(&target, is_capture) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                cleanup_com(com_ours);
+                return;
+            }
+        };
         let dev_vtbl = &**(device as *mut *const IMMDeviceVtbl);
-        let mut client: *mut c_void = ptr::null_mut();
-        if (dev_vtbl.activate)(device, &IID_IAUDIOCLIENT, ffi::CLSCTX_ALL, ptr::null_mut(), &mut client) < 0
-            || client.is_null()
-        {
-            (dev_vtbl.release)(device);
-            let _ = ready_tx.send(Err("IAudioClient::Activate failed".into()));
-            ffi::CoUninitialize();
-            return;
-        }
-        (dev_vtbl.release)(device);
 
-        let cli_vtbl = &**(client as *mut *const IAudioClientVtbl);
+        let mut client = match activate_audio_client_from_device(device) {
+            Ok(c) => c,
+            Err(e) => {
+                (dev_vtbl.release)(device);
+                let _ = ready_tx.send(Err(e));
+                cleanup_com(com_ours);
+                return;
+            }
+        };
+        let mut cli_vtbl = &**(client as *mut *const IAudioClientVtbl);
 
         let mut def_period: i64 = 0;
         let mut min_period: i64 = 0;
         let _ = (cli_vtbl.get_device_period)(client, &mut def_period, &mut min_period);
-        let req_period = ((requested_frames as f64 / requested_sr as f64) * 10_000_000.0) as i64;
+        let req_period = ((requested_frames as f64 / requested_sr.max(8000) as f64) * 10_000_000.0) as i64;
         let period = req_period.max(min_period.max(20_000)); // min 2ms
 
         // Coba inisialisasi Exclusive Mode: 32-bit Float Stereo -> 16-bit PCM Stereo
+        // dengan re-aktivasi fresh IAudioClient & penanganan AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED
         let mut chosen_wfx = WAVEFORMATEX {
             wFormatTag: 3, // WAVE_FORMAT_IEEE_FLOAT
             nChannels: 2,
@@ -356,18 +591,15 @@ fn run_exclusive_endpoint<FIn, FOut>(
             cbSize: 0,
         };
 
-        let mut init_hr = (cli_vtbl.initialize)(
-            client,
-            AUDCLNT_SHAREMODE_EXCLUSIVE,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            period,
-            period,
-            &chosen_wfx,
-            ptr::null(),
-        );
+        let mut init_hr = try_init_exclusive_aligned(device, &mut client, &chosen_wfx, period);
 
         if init_hr < 0 {
-            // Fallback ke 16-bit PCM Stereo di Exclusive Mode
+            if !client.is_null() {
+                let v = &**(client as *mut *const IAudioClientVtbl);
+                (v.release)(client);
+                client = ptr::null_mut();
+            }
+            // Fallback ke 16-bit PCM Stereo di Exclusive Mode pada IAudioClient baru
             chosen_wfx = WAVEFORMATEX {
                 wFormatTag: 1, // WAVE_FORMAT_PCM
                 nChannels: 2,
@@ -377,23 +609,21 @@ fn run_exclusive_endpoint<FIn, FOut>(
                 wBitsPerSample: 16,
                 cbSize: 0,
             };
-            init_hr = (cli_vtbl.initialize)(
-                client,
-                AUDCLNT_SHAREMODE_EXCLUSIVE,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                period,
-                period,
-                &chosen_wfx,
-                ptr::null(),
-            );
+            init_hr = try_init_exclusive_aligned(device, &mut client, &chosen_wfx, period);
         }
 
-        if init_hr < 0 {
-            (cli_vtbl.release)(client);
+        (dev_vtbl.release)(device);
+
+        if init_hr < 0 || client.is_null() {
+            if !client.is_null() {
+                let v = &**(client as *mut *const IAudioClientVtbl);
+                (v.release)(client);
+            }
             let _ = ready_tx.send(Err(format!("Hardware rejected WASAPI Exclusive (0x{:08X})", init_hr)));
-            ffi::CoUninitialize();
+            cleanup_com(com_ours);
             return;
         }
+        cli_vtbl = &**(client as *mut *const IAudioClientVtbl);
 
         let h_event = ffi::CreateEventW(ptr::null_mut(), 0, 0, ptr::null());
         if h_event.is_null() || (cli_vtbl.set_event_handle)(client, h_event) < 0 {
@@ -402,12 +632,19 @@ fn run_exclusive_endpoint<FIn, FOut>(
             }
             (cli_vtbl.release)(client);
             let _ = ready_tx.send(Err("SetEventHandle failed".into()));
-            ffi::CoUninitialize();
+            cleanup_com(com_ours);
             return;
         }
 
         let mut buf_frames: u32 = 0;
-        let _ = (cli_vtbl.get_buffer_size)(client, &mut buf_frames);
+        let gbs_hr = (cli_vtbl.get_buffer_size)(client, &mut buf_frames);
+        if gbs_hr < 0 || buf_frames == 0 {
+            ffi::CloseHandle(h_event);
+            (cli_vtbl.release)(client);
+            let _ = ready_tx.send(Err(format!("GetBufferSize failed (0x{:08X}, frames={})", gbs_hr, buf_frames)));
+            cleanup_com(com_ours);
+            return;
+        }
         let ch = chosen_wfx.nChannels as usize;
         let is_float = chosen_wfx.wFormatTag == 3;
         let mut scratch = vec![0.0f32; (buf_frames as usize).max(4096) * ch];
@@ -418,7 +655,7 @@ fn run_exclusive_endpoint<FIn, FOut>(
                 ffi::CloseHandle(h_event);
                 (cli_vtbl.release)(client);
                 let _ = ready_tx.send(Err("GetService IAudioCaptureClient failed".into()));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
                 return;
             }
             let cap_vtbl = &**(cap_client as *mut *const IAudioCaptureClientVtbl);
@@ -427,14 +664,14 @@ fn run_exclusive_endpoint<FIn, FOut>(
                 ffi::CloseHandle(h_event);
                 (cli_vtbl.release)(client);
                 let _ = ready_tx.send(Err("IAudioClient::Start failed".into()));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
                 return;
             }
 
-            let _ = ready_tx.send(Ok(chosen_wfx.nSamplesPerSec));
+            let _ = ready_tx.send(Ok((chosen_wfx.nSamplesPerSec, buf_frames)));
             log_info(format!(
-                "[WASAPI Exclusive] Capture aktif @ {}Hz ({}-bit)",
-                chosen_wfx.nSamplesPerSec, chosen_wfx.wBitsPerSample
+                "[WASAPI Exclusive] Capture aktif @ {}Hz ({}-bit, buf={} smp)",
+                chosen_wfx.nSamplesPerSec, chosen_wfx.wBitsPerSample, buf_frames
             ));
 
             while !stop_flag.load(Ordering::Relaxed) {
@@ -461,12 +698,16 @@ fn run_exclusive_endpoint<FIn, FOut>(
                         if (flags & 2) != 0 || p_data.is_null() {
                             scratch[..total_smp].fill(0.0);
                         } else if is_float {
-                            let f_slice = std::slice::from_raw_parts(p_data as *const f32, total_smp);
-                            scratch[..total_smp].copy_from_slice(f_slice);
+                            ptr::copy_nonoverlapping(
+                                p_data,
+                                scratch.as_mut_ptr() as *mut u8,
+                                total_smp * std::mem::size_of::<f32>(),
+                            );
                         } else {
-                            let i_slice = std::slice::from_raw_parts(p_data as *const i16, total_smp);
-                            for (dst, &src) in scratch[..total_smp].iter_mut().zip(i_slice.iter()) {
-                                *dst = (src as f32) / 32768.0;
+                            let src_ptr = p_data as *const i16;
+                            for (i, dst) in scratch[..total_smp].iter_mut().enumerate() {
+                                let s = ptr::read_unaligned(src_ptr.add(i));
+                                *dst = (s as f32) / 32768.0;
                             }
                         }
                         let _ = (cap_vtbl.release_buffer)(cap_client, frames_avail);
@@ -483,7 +724,7 @@ fn run_exclusive_endpoint<FIn, FOut>(
                 ffi::CloseHandle(h_event);
                 (cli_vtbl.release)(client);
                 let _ = ready_tx.send(Err("GetService IAudioRenderClient failed".into()));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
                 return;
             }
             let ren_vtbl = &**(ren_client as *mut *const IAudioRenderClientVtbl);
@@ -499,14 +740,14 @@ fn run_exclusive_endpoint<FIn, FOut>(
                 ffi::CloseHandle(h_event);
                 (cli_vtbl.release)(client);
                 let _ = ready_tx.send(Err("IAudioClient::Start Output failed".into()));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
                 return;
             }
 
-            let _ = ready_tx.send(Ok(chosen_wfx.nSamplesPerSec));
+            let _ = ready_tx.send(Ok((chosen_wfx.nSamplesPerSec, buf_frames)));
             log_info(format!(
-                "[WASAPI Exclusive] Render aktif @ {}Hz ({}-bit)",
-                chosen_wfx.nSamplesPerSec, chosen_wfx.wBitsPerSample
+                "[WASAPI Exclusive] Render aktif @ {}Hz ({}-bit, buf={} smp)",
+                chosen_wfx.nSamplesPerSec, chosen_wfx.wBitsPerSample, buf_frames
             ));
 
             while !stop_flag.load(Ordering::Relaxed) {
@@ -521,12 +762,16 @@ fn run_exclusive_endpoint<FIn, FOut>(
                     if (ren_vtbl.get_buffer)(ren_client, buf_frames, &mut p_data) >= 0 && !p_data.is_null() {
                         out_cb(&mut scratch[..total_smp], ch, n);
                         if is_float {
-                            let f_out = std::slice::from_raw_parts_mut(p_data as *mut f32, total_smp);
-                            f_out.copy_from_slice(&scratch[..total_smp]);
+                            ptr::copy_nonoverlapping(
+                                scratch.as_ptr() as *const u8,
+                                p_data,
+                                total_smp * std::mem::size_of::<f32>(),
+                            );
                         } else {
-                            let i_out = std::slice::from_raw_parts_mut(p_data as *mut i16, total_smp);
-                            for (dst, &src) in i_out.iter_mut().zip(scratch[..total_smp].iter()) {
-                                *dst = (src.clamp(-1.0, 1.0) * 32767.0) as i16;
+                            let dst_ptr = p_data as *mut i16;
+                            for (i, &src) in scratch[..total_smp].iter().enumerate() {
+                                let v = (src.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                ptr::write_unaligned(dst_ptr.add(i), v);
                             }
                         }
                         let _ = (ren_vtbl.release_buffer)(ren_client, buf_frames, 0);
@@ -540,7 +785,7 @@ fn run_exclusive_endpoint<FIn, FOut>(
 
         ffi::CloseHandle(h_event);
         (cli_vtbl.release)(client);
-        ffi::CoUninitialize();
+        cleanup_com(com_ours);
     }
 }
 
@@ -581,6 +826,8 @@ pub struct WasapiFlexAsioPair {
     pub out_mode_tag: String,
     pub actual_in_buf: u32,
     pub actual_out_buf: u32,
+    pub actual_in_hw_frames: u32,
+    pub actual_out_hw_frames: u32,
 }
 
 unsafe impl Send for WasapiFlexAsioPair {}
@@ -588,8 +835,8 @@ unsafe impl Sync for WasapiFlexAsioPair {}
 
 impl WasapiFlexAsioPair {
     pub fn try_start<FIn, FOut>(
-        in_idx: Option<usize>,
-        out_idx: Option<usize>,
+        in_target: Option<WasapiEndpointTarget>,
+        out_target: Option<WasapiEndpointTarget>,
         sample_rate: u32,
         buffer_size: u32,
         set_in_latency_ms: Option<f32>,
@@ -610,8 +857,8 @@ impl WasapiFlexAsioPair {
             ..Default::default()
         };
         Self::try_start_with_options(
-            in_idx,
-            out_idx,
+            in_target,
+            out_target,
             sample_rate,
             buffer_size,
             in_opts,
@@ -623,8 +870,8 @@ impl WasapiFlexAsioPair {
 
     #[allow(clippy::too_many_arguments)]
     pub fn try_start_with_options<FIn, FOut>(
-        in_idx: Option<usize>,
-        out_idx: Option<usize>,
+        in_target: Option<WasapiEndpointTarget>,
+        out_target: Option<WasapiEndpointTarget>,
         sample_rate: u32,
         buffer_size: u32,
         in_opts: FlexAsioEndpointOptions,
@@ -638,23 +885,23 @@ impl WasapiFlexAsioPair {
     {
         #[cfg(windows)]
         {
-            if in_idx.is_none() && out_idx.is_none() {
+            if in_target.is_none() && out_target.is_none() {
                 return Err("At least one physical device must be selected".into());
             }
             let stop_flag = Arc::new(AtomicBool::new(false));
 
             // KASUS 1: Output adalah Virtual Bus (`ASIO Line A Out`), sehingga hanya Input fisik yang berjalan
-            // dan setiap blok Input langsung memicu `out_cb` secara lockstep!
-            if let (Some(idx_in), None) = (in_idx, out_idx) {
+            if let (Some(tgt_in), None) = (&in_target, &out_target) {
+                let tgt_in = tgt_in.clone();
                 let (in_ready_tx, in_ready_rx) =
-                    std::sync::mpsc::sync_channel::<Result<(u32, u32, String), String>>(1);
+                    std::sync::mpsc::sync_channel::<Result<(u32, u32, u32, String), String>>(1);
                 let stop_in = Arc::clone(&stop_flag);
                 let t = thread::Builder::new()
                     .name("rinka-flex-asio-in-to-vbus".into())
                     .spawn(move || {
                         run_flex_asio_endpoint(
                             true,
-                            idx_in,
+                            tgt_in,
                             sample_rate,
                             buffer_size,
                             in_opts,
@@ -669,7 +916,7 @@ impl WasapiFlexAsioPair {
                     .map_err(|e| e.to_string())?;
 
                 return match in_ready_rx.recv() {
-                    Ok(Ok((sr, b_in, tag))) => Ok(Self {
+                    Ok(Ok((sr, b_in, hw_in, tag))) => Ok(Self {
                         stop_flag,
                         in_thread: Some(t),
                         out_thread: None,
@@ -678,6 +925,8 @@ impl WasapiFlexAsioPair {
                         out_mode_tag: "ASIO-LineA-Out".to_string(),
                         actual_in_buf: b_in,
                         actual_out_buf: b_in,
+                        actual_in_hw_frames: hw_in,
+                        actual_out_hw_frames: 0,
                     }),
                     Ok(Err(e)) => {
                         stop_flag.store(true, Ordering::SeqCst);
@@ -693,19 +942,20 @@ impl WasapiFlexAsioPair {
             }
 
             // KASUS 2: Output adalah perangkat fisik (dengan Input fisik atau Input Virtual `ASIO Line B In`)
-            let Some(idx_out) = out_idx else {
-                return Err("Output device index not found".into());
+            let Some(tgt_out) = out_target else {
+                return Err("Output device target not found".into());
             };
-            let (in_thread, in_sr, in_tag, act_in_buf) = if let Some(idx_in) = in_idx {
+            let has_in = in_target.is_some();
+            let (in_thread, in_sr, in_tag, act_in_buf, act_in_hw) = if let Some(tgt_in) = in_target {
                 let (in_ready_tx, in_ready_rx) =
-                    std::sync::mpsc::sync_channel::<Result<(u32, u32, String), String>>(1);
+                    std::sync::mpsc::sync_channel::<Result<(u32, u32, u32, String), String>>(1);
                 let stop_in = Arc::clone(&stop_flag);
                 let t = thread::Builder::new()
                     .name("rinka-flex-asio-in".into())
                     .spawn(move || {
                         run_flex_asio_endpoint(
                             true,
-                            idx_in,
+                            tgt_in,
                             sample_rate,
                             buffer_size,
                             in_opts,
@@ -718,7 +968,7 @@ impl WasapiFlexAsioPair {
                     .map_err(|e| e.to_string())?;
 
                 match in_ready_rx.recv() {
-                    Ok(Ok((sr, b_in, tag))) => (Some(t), sr, tag, b_in),
+                    Ok(Ok((sr, b_in, hw_in, tag))) => (Some(t), sr, tag, b_in, hw_in),
                     Ok(Err(e)) => {
                         stop_flag.store(true, Ordering::SeqCst);
                         let _ = t.join();
@@ -731,18 +981,18 @@ impl WasapiFlexAsioPair {
                     }
                 }
             } else {
-                (None, sample_rate, "ASIO-LineB-In".to_string(), buffer_size)
+                (None, sample_rate, "ASIO-LineB-In".to_string(), buffer_size, 0)
             };
 
             let (out_ready_tx, out_ready_rx) =
-                std::sync::mpsc::sync_channel::<Result<(u32, u32, String), String>>(1);
+                std::sync::mpsc::sync_channel::<Result<(u32, u32, u32, String), String>>(1);
             let stop_out = Arc::clone(&stop_flag);
             let out_thread = thread::Builder::new()
                 .name("rinka-flex-asio-out".into())
                 .spawn(move || {
                     run_flex_asio_endpoint(
                         false,
-                        idx_out,
+                        tgt_out,
                         in_sr,
                         buffer_size,
                         out_opts,
@@ -755,15 +1005,17 @@ impl WasapiFlexAsioPair {
                 .map_err(|e| e.to_string())?;
 
             match out_ready_rx.recv() {
-                Ok(Ok((out_sr, act_out_buf, out_tag))) => Ok(Self {
+                Ok(Ok((out_sr, act_out_buf, act_out_hw, out_tag))) => Ok(Self {
                     stop_flag,
                     in_thread,
                     out_thread: Some(out_thread),
-                    active_sample_rate: if in_idx.is_some() { in_sr } else { out_sr },
+                    active_sample_rate: if has_in { in_sr } else { out_sr },
                     in_mode_tag: in_tag,
                     out_mode_tag: out_tag,
-                    actual_in_buf: if in_idx.is_some() { act_in_buf } else { act_out_buf },
+                    actual_in_buf: if has_in { act_in_buf } else { act_out_buf },
                     actual_out_buf: act_out_buf,
+                    actual_in_hw_frames: act_in_hw,
+                    actual_out_hw_frames: act_out_hw,
                 }),
                 Ok(Err(e)) => {
                     stop_flag.store(true, Ordering::SeqCst);
@@ -786,8 +1038,8 @@ impl WasapiFlexAsioPair {
         #[cfg(not(windows))]
         {
             let _ = (
-                in_idx,
-                out_idx,
+                in_target,
+                out_target,
                 sample_rate,
                 buffer_size,
                 in_opts,
@@ -816,12 +1068,12 @@ impl Drop for WasapiFlexAsioPair {
 #[allow(clippy::too_many_arguments)]
 fn run_flex_asio_endpoint<FIn, FOut>(
     is_capture: bool,
-    dev_idx: usize,
+    target: WasapiEndpointTarget,
     requested_sr: u32,
     requested_frames: u32,
     opts: FlexAsioEndpointOptions,
     stop_flag: Arc<AtomicBool>,
-    ready_tx: std::sync::mpsc::SyncSender<Result<(u32, u32, String), String>>,
+    ready_tx: std::sync::mpsc::SyncSender<Result<(u32, u32, u32, String), String>>,
     mut in_cb: FIn,
     mut out_cb: FOut,
 ) where
@@ -829,61 +1081,31 @@ fn run_flex_asio_endpoint<FIn, FOut>(
     FOut: FnMut(&mut [f32], usize, usize),
 {
     unsafe {
-        let _ = ffi::CoInitializeEx(ptr::null_mut(), ffi::COINIT_MULTITHREADED);
+        let hr_com = ffi::CoInitializeEx(ptr::null_mut(), ffi::COINIT_MULTITHREADED);
+        let com_ours = hr_com == 0 || hr_com == 1;
         let _ = boost_audio_thread();
-
-        let open_device_client = |idx: usize, cap: bool| -> Result<*mut c_void, String> {
-            let mut enumerator: *mut c_void = ptr::null_mut();
-            let hr = ffi::CoCreateInstance(
-                &CLSID_MMDEVICE_ENUMERATOR,
-                ptr::null_mut(),
-                ffi::CLSCTX_ALL,
-                &IID_IMMDEVICE_ENUMERATOR,
-                &mut enumerator,
-            );
-            if hr < 0 || enumerator.is_null() {
-                return Err(format!("IMMDeviceEnumerator gagal (0x{:08X})", hr));
+        let cleanup_com = |ours: bool| {
+            if ours {
+                ffi::CoUninitialize();
             }
-            let enum_vtbl = &**(enumerator as *mut *const IMMDeviceEnumeratorVtbl);
-            let data_flow = if cap { 1 } else { 0 };
-            let mut collection: *mut c_void = ptr::null_mut();
-            if (enum_vtbl.enum_audio_endpoints)(enumerator, data_flow, 1, &mut collection) < 0
-                || collection.is_null()
-            {
-                (enum_vtbl.release)(enumerator);
-                return Err("EnumAudioEndpoints gagal".into());
-            }
-            let col_vtbl = &**(collection as *mut *const IMMDeviceCollectionVtbl);
-            let mut device: *mut c_void = ptr::null_mut();
-            if (col_vtbl.item)(collection, idx as u32, &mut device) < 0 || device.is_null() {
-                (col_vtbl.release)(collection);
-                (enum_vtbl.release)(enumerator);
-                return Err("Device not found".into());
-            }
-            (col_vtbl.release)(collection);
-            (enum_vtbl.release)(enumerator);
-
-            let dev_vtbl = &**(device as *mut *const IMMDeviceVtbl);
-            let mut client: *mut c_void = ptr::null_mut();
-            let act_hr = (dev_vtbl.activate)(
-                device,
-                &IID_IAUDIOCLIENT,
-                ffi::CLSCTX_ALL,
-                ptr::null_mut(),
-                &mut client,
-            );
-            (dev_vtbl.release)(device);
-            if act_hr < 0 || client.is_null() {
-                return Err("IAudioClient::Activate failed".into());
-            }
-            Ok(client)
         };
 
-        let mut client = match open_device_client(dev_idx, is_capture) {
-            Ok(c) => c,
+        let device = match open_mmdevice(&target, is_capture) {
+            Ok(d) => d,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
+                return;
+            }
+        };
+        let dev_vtbl = &**(device as *mut *const IMMDeviceVtbl);
+
+        let mut client = match activate_audio_client_from_device(device) {
+            Ok(c) => c,
+            Err(e) => {
+                (dev_vtbl.release)(device);
+                let _ = ready_tx.send(Err(e));
+                cleanup_com(com_ours);
                 return;
             }
         };
@@ -916,7 +1138,6 @@ fn run_flex_asio_endpoint<FIn, FOut>(
         let set_latency_ms = opts.set_latency_ms;
         let extra_padding_frames = match set_latency_ms {
             Some(lat_ms) if lat_ms > 0.05 => {
-                // Untuk Line A / Line B internal, jaga agar extra_padding tetap sangat ringan (mis. 0.2 -> 2.0ms)
                 let eff_ms = if lat_ms <= 0.5 {
                     (lat_ms as f64 * 10.0).min(10.0)
                 } else {
@@ -927,10 +1148,6 @@ fn run_flex_asio_endpoint<FIn, FOut>(
             _ => 0,
         };
 
-        // Ultra-Optimized Event-Driven WASAPI Buffer Duration:
-        // - Jika Set Latency = Auto (`<= 0.05 ms`), gunakan `def_period` ketat (`100_000..150_000` hns = 10.0..15.0 ms)
-        //   sehingga memangkas ~50-80ms latensi WASAPI dibanding FlexASIO standar tanpa membuat audio pecah/stutter!
-        // - Jika user menyetel Set Latency manual (`> 10.0 ms`), hormati durasi buffer WASAPI pilihan user.
         let shared_buf_duration = match set_latency_ms {
             Some(lat_ms) if lat_ms > 10.0 => {
                 ((lat_ms.clamp(10.0, 250.0) as f64) * 10_000.0) as i64
@@ -972,16 +1189,15 @@ fn run_flex_asio_endpoint<FIn, FOut>(
 
         let mut chosen_wfx = make_float_wfx(req_ch, requested_sr);
         let mut init_hr: i32 = -1;
+        let mut exclusive_active = false;
 
-        // Helper aman untuk me-release IAudioClient yang gagal initialize lalu membuka instance baru
-        // tanpa pernah meninggalkan dangling pointer jika open_device_client gagal.
         let reopen_fresh_client = |cur_client: &mut *mut c_void| -> Result<&'static IAudioClientVtbl, String> {
             if !cur_client.is_null() {
                 let v = &**(*cur_client as *mut *const IAudioClientVtbl);
                 (v.release)(*cur_client);
                 *cur_client = ptr::null_mut();
             }
-            let c = open_device_client(dev_idx, is_capture)?;
+            let c = activate_audio_client_from_device(device)?;
             *cur_client = c;
             Ok(&**(c as *mut *const IAudioClientVtbl))
         };
@@ -989,16 +1205,10 @@ fn run_flex_asio_endpoint<FIn, FOut>(
         // Jika user mencentang WASAPI Set + Exclusive di ASIO Setting, coba mode Exclusive terlebih dahulu
         if opts.wasapi_set && opts.wasapi_exclusive {
             let excl_period = smp_period.max(min_period.max(20_000));
-            init_hr = (cli_vtbl.initialize)(
-                client,
-                AUDCLNT_SHAREMODE_EXCLUSIVE,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                excl_period,
-                excl_period,
-                &chosen_wfx,
-                ptr::null(),
-            );
-            if init_hr < 0 {
+            init_hr = try_init_exclusive_aligned(device, &mut client, &chosen_wfx, excl_period);
+            if init_hr >= 0 {
+                exclusive_active = true;
+            } else {
                 if let Ok(vt) = reopen_fresh_client(&mut client) {
                     cli_vtbl = vt;
                     let pcm16_wfx = WAVEFORMATEX {
@@ -1010,27 +1220,22 @@ fn run_flex_asio_endpoint<FIn, FOut>(
                         wBitsPerSample: 16,
                         cbSize: 0,
                     };
-                    init_hr = (cli_vtbl.initialize)(
-                        client,
-                        AUDCLNT_SHAREMODE_EXCLUSIVE,
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                        excl_period,
-                        excl_period,
-                        &pcm16_wfx,
-                        ptr::null(),
-                    );
+                    init_hr = try_init_exclusive_aligned(device, &mut client, &pcm16_wfx, excl_period);
                     if init_hr >= 0 {
                         chosen_wfx = pcm16_wfx;
+                        exclusive_active = true;
                     } else if let Ok(vt2) = reopen_fresh_client(&mut client) {
                         cli_vtbl = vt2;
                     }
                 }
             }
+            if !client.is_null() {
+                cli_vtbl = &**(client as *mut *const IAudioClientVtbl);
+            }
         }
 
         // Jika sample rate & jumlah kanal sama persis dengan MixFormat native Windows,
         // utamakan inisialisasi Direct Event-Driven murni (tanpa AUTOCONVERTPCM / tanpa filter SRC Windows)
-        // sehingga kualitas suara 100% Bit-Exact identik dengan WASAPI murni!
         if init_hr < 0 && !client.is_null() && native_sr == requested_sr && req_ch == native_channels {
             chosen_wfx = make_float_wfx(req_ch, requested_sr);
             init_hr = (cli_vtbl.initialize)(
@@ -1077,7 +1282,6 @@ fn run_flex_asio_endpoint<FIn, FOut>(
             }
         }
 
-        // Jika 2 kanal ditolak (mis. endpoint Loopback/Mic dengan jumlah kanal khusus), gunakan `native_channels`!
         if init_hr < 0 && native_channels != 2 {
             if let Ok(vt) = reopen_fresh_client(&mut client) {
                 cli_vtbl = vt;
@@ -1110,14 +1314,18 @@ fn run_flex_asio_endpoint<FIn, FOut>(
             }
         }
 
+        (dev_vtbl.release)(device);
+
         if init_hr < 0 || client.is_null() {
             if !client.is_null() {
-                (cli_vtbl.release)(client);
+                let v = &**(client as *mut *const IAudioClientVtbl);
+                (v.release)(client);
             }
             let _ = ready_tx.send(Err(format!("Failed to initialize Flex-ASIO (0x{:08X})", init_hr)));
-            ffi::CoUninitialize();
+            cleanup_com(com_ours);
             return;
         }
+        cli_vtbl = &**(client as *mut *const IAudioClientVtbl);
 
         let h_event = ffi::CreateEventW(ptr::null_mut(), 0, 0, ptr::null());
         if h_event.is_null() || (cli_vtbl.set_event_handle)(client, h_event) < 0 {
@@ -1126,12 +1334,19 @@ fn run_flex_asio_endpoint<FIn, FOut>(
             }
             (cli_vtbl.release)(client);
             let _ = ready_tx.send(Err("Flex-ASIO SetEventHandle failed".into()));
-            ffi::CoUninitialize();
+            cleanup_com(com_ours);
             return;
         }
 
         let mut buf_frames: u32 = 0;
-        let _ = (cli_vtbl.get_buffer_size)(client, &mut buf_frames);
+        let gbs_hr = (cli_vtbl.get_buffer_size)(client, &mut buf_frames);
+        if gbs_hr < 0 || buf_frames == 0 {
+            ffi::CloseHandle(h_event);
+            (cli_vtbl.release)(client);
+            let _ = ready_tx.send(Err(format!("Flex-ASIO GetBufferSize failed (0x{:08X}, frames={})", gbs_hr, buf_frames)));
+            cleanup_com(com_ours);
+            return;
+        }
         let ch = chosen_wfx.nChannels.max(1) as usize;
         let is_float = chosen_wfx.wFormatTag == 3;
         let target_quantum = requested_frames.clamp(32, 1024);
@@ -1140,7 +1355,11 @@ fn run_flex_asio_endpoint<FIn, FOut>(
             .round()
             .max(128.0) as u32;
         let eff_quantum = target_quantum.min(buf_frames.max(32));
-        let mode_tag = format!("Flex-ASIO {}smp", eff_quantum);
+        let mode_tag = if exclusive_active {
+            format!("Flex-ASIO Excl {}smp", buf_frames)
+        } else {
+            format!("Flex-ASIO {}smp", eff_quantum)
+        };
         let mut scratch = vec![0.0f32; (buf_frames as usize).max(4096) * ch];
         let mut stereo_scratch = vec![0.0f32; (buf_frames as usize).max(4096) * 2];
 
@@ -1152,7 +1371,7 @@ fn run_flex_asio_endpoint<FIn, FOut>(
                 ffi::CloseHandle(h_event);
                 (cli_vtbl.release)(client);
                 let _ = ready_tx.send(Err("GetService IAudioCaptureClient failed".into()));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
                 return;
             }
             let cap_vtbl = &**(cap_client as *mut *const IAudioCaptureClientVtbl);
@@ -1161,14 +1380,15 @@ fn run_flex_asio_endpoint<FIn, FOut>(
                 ffi::CloseHandle(h_event);
                 (cli_vtbl.release)(client);
                 let _ = ready_tx.send(Err("IAudioClient::Start Capture failed".into()));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
                 return;
             }
 
-            let _ = ready_tx.send(Ok((chosen_wfx.nSamplesPerSec, eff_quantum, mode_tag.clone())));
+            let hw_cap_frames = if exclusive_active { buf_frames } else { def_period_frames };
+            let _ = ready_tx.send(Ok((chosen_wfx.nSamplesPerSec, eff_quantum, hw_cap_frames, mode_tag.clone())));
             log_info(format!(
-                "[ASIO Experimental] Capture ({}) aktif @ {}Hz ({} ch, smp={}, set_in={:?})",
-                mode_tag, chosen_wfx.nSamplesPerSec, ch, eff_quantum, set_latency_ms
+                "[ASIO Experimental] Capture ({}) aktif @ {}Hz ({} ch, smp={}, hw_frames={}, set_in={:?})",
+                mode_tag, chosen_wfx.nSamplesPerSec, ch, eff_quantum, hw_cap_frames, set_latency_ms
             ));
 
             while !stop_flag.load(Ordering::Relaxed) {
@@ -1198,17 +1418,20 @@ fn run_flex_asio_endpoint<FIn, FOut>(
                         if (flags & 2) != 0 || p_data.is_null() {
                             scratch[..total_smp].fill(0.0);
                         } else if is_float {
-                            let f_slice = std::slice::from_raw_parts(p_data as *const f32, total_smp);
-                            scratch[..total_smp].copy_from_slice(f_slice);
+                            ptr::copy_nonoverlapping(
+                                p_data,
+                                scratch.as_mut_ptr() as *mut u8,
+                                total_smp * std::mem::size_of::<f32>(),
+                            );
                         } else {
-                            let i_slice = std::slice::from_raw_parts(p_data as *const i16, total_smp);
-                            for (dst, &src) in scratch[..total_smp].iter_mut().zip(i_slice.iter()) {
-                                *dst = (src as f32) / 32768.0;
+                            let src_ptr = p_data as *const i16;
+                            for (i, dst) in scratch[..total_smp].iter_mut().enumerate() {
+                                let s = ptr::read_unaligned(src_ptr.add(i));
+                                *dst = (s as f32) / 32768.0;
                             }
                         }
                         let _ = (cap_vtbl.release_buffer)(cap_client, frames_avail);
 
-                        // Kirim paket capture secara utuh ke callback tanpa pemotongan sub-blok ganjil
                         in_cb(&scratch[..total_smp], ch, n);
                     }
                 }
@@ -1224,34 +1447,36 @@ fn run_flex_asio_endpoint<FIn, FOut>(
                 ffi::CloseHandle(h_event);
                 (cli_vtbl.release)(client);
                 let _ = ready_tx.send(Err("GetService IAudioRenderClient failed".into()));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
                 return;
             }
             let ren_vtbl = &**(ren_client as *mut *const IAudioRenderClientVtbl);
 
-            // Target pengisian padding di buffer WASAPI:
-            // Gunakan `def_period_frames * 2 + extra_padding_frames` (maks `buf_frames`) dan
-            // prime penuh sebesar `max_fill_target` sebelum `Start()` sehingga pada saat wakeup pertama
-            // Windows Audio Engine baru mengonsumsi `def_period_frames` (480 sampel) dan Render
-            // hanya meminta tepat `480` sampel (tidak pernah menyedot 960+ sampel sekaligus dari FIFO!).
-            // Target pengisian padding di buffer WASAPI:
-            // Gunakan `def_period_frames + safety_headroom` (~600 sampel = 12.5ms pada 48kHz Shared Mode)
-            // dan samakan `init_prime = max_fill_target`. Dengan demikian:
-            // 1. Saat wakeup pertama setelah `Start()` (ketika Windows Audio Engine mengambil 480 sampel),
-            //    masih tersisa 120 sampel (2.5ms) safety margin sehingga TIDAK PERNAH underrun!
-            // 2. Setiap wakeup hanya meminta tepat `480` sampel (tidak pernah menyedot 960 sampel sekaligus!).
             let safety_headroom = (eff_quantum / 2).clamp(128, 256);
-            let min_safe_fill = if opts.wasapi_exclusive && opts.wasapi_set {
-                eff_quantum.max(128).min(buf_frames.max(128))
+            let min_safe_fill = if exclusive_active {
+                buf_frames
             } else {
                 (def_period_frames + safety_headroom)
                     .max(eff_quantum + safety_headroom)
                     .min(buf_frames.max(256))
             };
-            let desired_fill = min_safe_fill + extra_padding_frames.min(def_period_frames);
-            let max_fill_target = desired_fill.clamp(min_safe_fill, buf_frames.max(min_safe_fill));
+            let desired_fill = if exclusive_active {
+                buf_frames
+            } else {
+                min_safe_fill + extra_padding_frames.min(def_period_frames)
+            };
+            let max_fill_target = if exclusive_active {
+                buf_frames
+            } else {
+                desired_fill.clamp(min_safe_fill, buf_frames.max(min_safe_fill))
+            };
 
-            let init_prime = max_fill_target.min(buf_frames);
+            // Exclusive Event-Driven mode REQUIRES priming the full `buf_frames` buffer before Start().
+            let init_prime = if exclusive_active {
+                buf_frames
+            } else {
+                max_fill_target.min(buf_frames)
+            };
             if init_prime > 0 {
                 let mut p_init: *mut u8 = ptr::null_mut();
                 if (ren_vtbl.get_buffer)(ren_client, init_prime, &mut p_init) >= 0 {
@@ -1264,27 +1489,31 @@ fn run_flex_asio_endpoint<FIn, FOut>(
                 ffi::CloseHandle(h_event);
                 (cli_vtbl.release)(client);
                 let _ = ready_tx.send(Err("IAudioClient::Start Render failed".into()));
-                ffi::CoUninitialize();
+                cleanup_com(com_ours);
                 return;
             }
 
-            let _ = ready_tx.send(Ok((chosen_wfx.nSamplesPerSec, eff_quantum, mode_tag.clone())));
+            let hw_ren_frames = if exclusive_active { buf_frames } else { max_fill_target.min(buf_frames) };
+            let _ = ready_tx.send(Ok((chosen_wfx.nSamplesPerSec, eff_quantum, hw_ren_frames, mode_tag.clone())));
             log_info(format!(
                 "[ASIO Experimental] Render ({}) aktif @ {}Hz ({} ch, smp={}, target_fill={}, set_out={:?})",
-                mode_tag, chosen_wfx.nSamplesPerSec, ch, eff_quantum, max_fill_target, set_latency_ms
+                mode_tag, chosen_wfx.nSamplesPerSec, ch, eff_quantum, hw_ren_frames, set_latency_ms
             ));
 
             while !stop_flag.load(Ordering::Relaxed) {
                 let w = ffi::WaitForSingleObject(h_event, 50);
                 if w == ffi::WAIT_OBJECT_0 {
-                    let mut padding: u32 = 0;
-                    let _ = (cli_vtbl.get_current_padding)(client, &mut padding);
-                    let avail_space = buf_frames.saturating_sub(padding);
-                    let needed = max_fill_target.saturating_sub(padding);
-                    // Penting: JANGAN membatasi `frames_to_write` dengan `.min(target_quantum)`!
-                    // Kita wajib mengisi seluruh `needed` sampel yang baru saja dikonsumsi Windows Audio Engine
-                    // agar kecepatan baca selalu 100% sama dengan kecepatan hardware (48.000 Hz)!
-                    let frames_to_write = needed.min(avail_space);
+                    // Exclusive Event-Driven mode always requires GetBuffer(buf_frames) (full buffer);
+                    // Shared Event-Driven mode fills up to `max_fill_target`.
+                    let frames_to_write = if exclusive_active {
+                        buf_frames
+                    } else {
+                        let mut padding: u32 = 0;
+                        let _ = (cli_vtbl.get_current_padding)(client, &mut padding);
+                        let avail_space = buf_frames.saturating_sub(padding);
+                        let needed = max_fill_target.saturating_sub(padding);
+                        needed.min(avail_space)
+                    };
 
                     if frames_to_write > 0 {
                         let mut p_data: *mut u8 = ptr::null_mut();
@@ -1320,15 +1549,16 @@ fn run_flex_asio_endpoint<FIn, FOut>(
                             }
 
                             if is_float {
-                                let f_out =
-                                    std::slice::from_raw_parts_mut(p_data as *mut f32, total_smp);
-                                f_out.copy_from_slice(&scratch[..total_smp]);
+                                ptr::copy_nonoverlapping(
+                                    scratch.as_ptr() as *const u8,
+                                    p_data,
+                                    total_smp * std::mem::size_of::<f32>(),
+                                );
                             } else {
-                                let i_out =
-                                    std::slice::from_raw_parts_mut(p_data as *mut i16, total_smp);
-                                for (dst, &src) in i_out.iter_mut().zip(scratch[..total_smp].iter())
-                                {
-                                    *dst = (src.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                let dst_ptr = p_data as *mut i16;
+                                for (i, &src) in scratch[..total_smp].iter().enumerate() {
+                                    let v = (src.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                    ptr::write_unaligned(dst_ptr.add(i), v);
                                 }
                             }
                             let _ = (ren_vtbl.release_buffer)(ren_client, frames_to_write, 0);
@@ -1343,6 +1573,6 @@ fn run_flex_asio_endpoint<FIn, FOut>(
 
         ffi::CloseHandle(h_event);
         (cli_vtbl.release)(client);
-        ffi::CoUninitialize();
+        cleanup_com(com_ours);
     }
 }

@@ -1,9 +1,9 @@
-//! Modul DSP v2.0:
+//! Modul DSP v2.3 (NEON):
 //! - `AudioScratchBuffers`: Pre-alokasi memori agar callback audio berjalan Zero-Heap-Allocation
-//! - `DcBlockerStereo`: Filter High-Pass 20Hz Orde-1 Zero-Latency untuk membuang DC offset & sub-sonic rumble sebelum VST3
-//! - `soft_limit_stereo`: First-Order ADAA (Anti-Derivative Anti-Aliasing) + `tanh` True-Peak Soft Limiter
+//! - `DcBlockerStereo`: Filter High-Pass 5Hz Orde-1 Zero-Latency (f64) untuk membuang DC offset sebelum VST3
+//! - `soft_limit_stereo`: Stereo-Linked C2-Continuous True-Peak Soft Limiter (`tanh`, 64-bit)
 //! - `AudioOverlayPlayer` & `OverlayBank`: Pemutar file audio (Symphonia + 80ms loop crossfade)
-//! - `LatencyProbe`: Pengukur latensi In A -> Out B berbasis FFT Envelope Cross-Correlation
+//! - `LatencyProbe`: Pengukur latensi In A -> Out B berbasis Cross-SR FFT Envelope Cross-Correlation
 
 use parking_lot::Mutex;
 use rustfft::{num_complex::Complex, FftPlanner};
@@ -31,9 +31,13 @@ pub struct AudioScratchBuffers {
     pub bus_r: Vec<f32>,
 }
 
+pub const MAX_SCRATCH_FRAMES: usize = 65_536;
+
 impl AudioScratchBuffers {
     pub fn with_capacity(max_frames: usize) -> Self {
-        let cap = max_frames.max(4096);
+        // Pre-allocate at least 8192 frames (~170ms @ 48kHz) up to MAX_SCRATCH_FRAMES
+        // so normal WASAPI/ASIO callbacks never trigger heap resizing on RT threads.
+        let cap = max_frames.clamp(8192, MAX_SCRATCH_FRAMES);
         Self {
             left: vec![0.0; cap],
             right: vec![0.0; cap],
@@ -47,14 +51,16 @@ impl AudioScratchBuffers {
 
     #[inline]
     pub fn ensure_frames(&mut self, frames: usize) {
-        if frames > self.left.len() {
-            self.left.resize(frames, 0.0);
-            self.right.resize(frames, 0.0);
-            self.prev_l.resize(frames, 0.0);
-            self.prev_r.resize(frames, 0.0);
-            self.mono_probe.resize(frames, 0.0);
-            self.bus_l.resize(frames, 0.0);
-            self.bus_r.resize(frames, 0.0);
+        let clamped = frames.min(MAX_SCRATCH_FRAMES);
+        if clamped > self.left.len() {
+            let new_cap = clamped.next_power_of_two().min(MAX_SCRATCH_FRAMES);
+            self.left.resize(new_cap, 0.0);
+            self.right.resize(new_cap, 0.0);
+            self.prev_l.resize(new_cap, 0.0);
+            self.prev_r.resize(new_cap, 0.0);
+            self.mono_probe.resize(new_cap, 0.0);
+            self.bus_l.resize(new_cap, 0.0);
+            self.bus_r.resize(new_cap, 0.0);
         }
     }
 }
@@ -145,62 +151,6 @@ impl DcBlockerStereo {
 
 /// Kurva C2-Continuous (nilai, turunan ke-1, dan turunan ke-2 kontinu di |x| == threshold)
 /// dalam presisi 64-bit (`f64`) dengan 0.0-sample phase shift dan 100% bit-exact di bawah threshold.
-#[inline]
-fn soft_clip_sample_f64(x: f32, threshold: f64, headroom: f64) -> f32 {
-    let xf = x as f64;
-    let abs_x = xf.abs();
-    if abs_x <= threshold {
-        x
-    } else {
-        let excess = abs_x - threshold;
-        let limited = threshold + headroom * (excess / headroom).tanh();
-        (xf.signum() * limited) as f32
-    }
-}
-
-pub fn soft_limit_slice(samples: &mut [f32], threshold: f32, ceiling: f32) {
-    let mut peak = 0.0f32;
-    let mut has_non_finite = false;
-    for &x in samples.iter() {
-        if !x.is_finite() {
-            has_non_finite = true;
-            break;
-        }
-        let a = x.abs();
-        if a > peak {
-            peak = a;
-        }
-    }
-
-    if has_non_finite {
-        peak = 0.0;
-        for x in samples.iter_mut() {
-            if x.is_nan() {
-                *x = 0.0;
-            } else if x.is_infinite() {
-                *x = if *x > 0.0 { 1.0 } else { -1.0 };
-            }
-            let a = x.abs();
-            if a > peak {
-                peak = a;
-            }
-        }
-    }
-
-    if peak <= threshold {
-        return;
-    }
-
-    let thr_f64 = threshold as f64;
-    let headroom_f64 = ((ceiling - threshold) as f64).max(1e-5);
-    for x_ref in samples.iter_mut() {
-        let x = *x_ref;
-        if x.abs() > threshold {
-            *x_ref = soft_clip_sample_f64(x, thr_f64, headroom_f64);
-        }
-    }
-}
-
 /// Stereo-Linked C2-Continuous True-Peak Limiter (64-bit precision):
 /// Menjaga koherensi fase & keseimbangan citra stereo (L/R mendapat faktor gain identik pada setiap sampel)
 /// serta 100% bit-exact di bawah `threshold`.
@@ -259,7 +209,7 @@ pub fn soft_limit_stereo_linked(left: &mut [f32], right: &mut [f32], threshold: 
 
 /// Sanitasi Pre/Post-VST 100% Bit-Exact 32-Bit Float (`threshold = 3.95`, `ceiling = 4.00`):
 /// Tidak pernah mengompresi atau mengubah satu bit pun sinyal audio normal (`-12 dBFS .. +11.9 dBFS`),
-/// hanya membersihkan NaN/Inf atau ledakan fault ekstrem di atas +12 dBFS agar rantai VST3 dan Vonovox
+/// hanya membersihkan NaN/Inf atau ledakan fault ekstrem di atas +12 dBFS agar rantai VST3 dan AI Voice Changer
 /// menerima 100% dinamika asli seperti WASAPI Shared murni!
 #[inline]
 pub fn soft_limit_pre_vst_stereo(left: &mut [f32], right: &mut [f32]) {
@@ -284,6 +234,7 @@ struct ProbeInner {
     buffer: Vec<f32>,
     write_pos: usize,
     filled: usize,
+    last_write_instant: Option<std::time::Instant>,
 }
 
 pub struct LatencyProbe {
@@ -300,6 +251,7 @@ impl LatencyProbe {
                 buffer: vec![0.0; max_samples],
                 write_pos: 0,
                 filled: 0,
+                last_write_instant: None,
             }),
         }
     }
@@ -315,9 +267,16 @@ impl LatencyProbe {
         g.buffer = vec![0.0; g.max_samples];
         g.write_pos = 0;
         g.filled = 0;
+        g.last_write_instant = None;
     }
 
     pub fn write(&self, mono_block: &[f32]) {
+        self.write_at(mono_block, std::time::Instant::now());
+    }
+
+    /// Write mono samples tagged with the wall-clock timestamp of the tail sample
+    /// so cross-thread snapshot phase skew `(t_a - t_b)` can be subtracted cleanly.
+    pub fn write_at(&self, mono_block: &[f32], ts: std::time::Instant) {
         let n = mono_block.len();
         if n == 0 {
             return;
@@ -330,6 +289,7 @@ impl LatencyProbe {
             g.buffer.copy_from_slice(&mono_block[n - ms..]);
             g.write_pos = 0;
             g.filled = ms;
+            g.last_write_instant = Some(ts);
             return;
         }
         let wp = g.write_pos;
@@ -343,45 +303,93 @@ impl LatencyProbe {
         }
         g.write_pos = (wp + n) % ms;
         g.filled = (g.filled + n).min(ms);
+        g.last_write_instant = Some(ts);
     }
 
     pub fn snapshot(&self) -> Vec<f32> {
+        self.snapshot_with_meta().0
+    }
+
+    pub fn snapshot_with_meta(&self) -> (Vec<f32>, Option<std::time::Instant>, u32) {
         let g = self.inner.lock();
-        if g.filled < g.max_samples {
+        let data = if g.filled < g.max_samples {
             g.buffer[..g.write_pos].to_vec()
         } else {
             let mut out = Vec::with_capacity(g.max_samples);
             out.extend_from_slice(&g.buffer[g.write_pos..]);
             out.extend_from_slice(&g.buffer[..g.write_pos]);
             out
-        }
+        };
+        (data, g.last_write_instant, g.sample_rate)
+    }
+
+    pub fn clear(&self) {
+        let mut g = self.inner.lock();
+        g.buffer.fill(0.0);
+        g.write_pos = 0;
+        g.filled = 0;
+        g.last_write_instant = None;
     }
 }
 
 pub fn estimate_latency_ms(probe_a: &LatencyProbe, probe_b: &LatencyProbe, max_lag_ms: f64) -> Option<f64> {
-    let sr_a = probe_a.sample_rate();
-    let sr_b = probe_b.sample_rate();
+    estimate_latency_ms_with_ceiling(probe_a, probe_b, max_lag_ms, max_lag_ms)
+}
+
+pub fn estimate_latency_ms_with_ceiling(
+    probe_a: &LatencyProbe,
+    probe_b: &LatencyProbe,
+    max_lag_ms: f64,
+    realistic_ceiling_ms: f64,
+) -> Option<f64> {
+    let (a_full, ts_a, sr_a) = probe_a.snapshot_with_meta();
+    let (b_full, ts_b, sr_b) = probe_b.snapshot_with_meta();
     if sr_a == 0 || sr_b == 0 {
         return None;
     }
-    let a_full = probe_a.snapshot();
-    let b_full = probe_b.snapshot();
 
-    // Gunakan envelope rate tetap ~400 Hz agar tetap bekerja meskipun SR Line A != SR Line B
+    // Hitung selisih fase tulis antar-thread `dt_skew_ms = (t_a - t_b)` dalam ms.
+    // Jika A menulis lebih baru dari B (`t_a > t_b`), indeks puncak lag bergeser maju sebesar `(t_a - t_b)`,
+    // sehingga delay fisik sejati adalah `raw_lag_ms - (t_a - t_b)`.
+    let dt_skew_ms: f64 = match (ts_a, ts_b) {
+        (Some(ta), Some(tb)) => {
+            let skew = if ta >= tb {
+                ta.duration_since(tb).as_secs_f64() * 1000.0
+            } else {
+                -(tb.duration_since(ta).as_secs_f64() * 1000.0)
+            };
+            if skew.abs() > 500.0 {
+                return None;
+            }
+            skew
+        }
+        _ => 0.0,
+    };
+
+    // Gunakan envelope rate tetap ~400 Hz; jika SR Line A != SR Line B, resample `env_b`
+    // tepat ke grid waktu `env_sr_a` (terjangkar pada tail `t_b`) agar 0% drift lintas sample rate!
     let env_sr = 400.0f64;
     let blk_a = ((sr_a as f64 / env_sr).round() as usize).max(1);
     let blk_b = ((sr_b as f64 / env_sr).round() as usize).max(1);
+    let actual_env_sr = (sr_a as f64) / (blk_a as f64);
+    let env_sr_b = (sr_b as f64) / (blk_b as f64);
 
     let nb_a = a_full.len() / blk_a;
     let nb_b = b_full.len() / blk_b;
-    let num_blocks = nb_a.min(nb_b);
-    if num_blocks < 80 {
+    let rate_ratio = env_sr_b / actual_env_sr;
+    let nb_b_mapped = if rate_ratio > 0.0 {
+        ((nb_b as f64) / rate_ratio).floor() as usize
+    } else {
+        0
+    };
+    let num_blocks = nb_a.min(nb_b_mapped);
+    if num_blocks < 80 || nb_b < 80 {
         // Minimal ~0.2 detik histori audio
         return None;
     }
 
     let a_slice = &a_full[a_full.len() - num_blocks * blk_a..];
-    let b_slice = &b_full[b_full.len() - num_blocks * blk_b..];
+    let b_slice = &b_full[b_full.len() - nb_b * blk_b..];
 
     let rms_a = (a_slice.iter().map(|x| x * x).sum::<f32>() / a_slice.len() as f32).sqrt();
     let rms_b = (b_slice.iter().map(|x| x * x).sum::<f32>() / b_slice.len() as f32).sqrt();
@@ -390,18 +398,37 @@ pub fn estimate_latency_ms(probe_a: &LatencyProbe, probe_b: &LatencyProbe, max_l
     }
 
     let mut env_a = Vec::with_capacity(num_blocks);
-    let mut env_b = Vec::with_capacity(num_blocks);
-
     for i in 0..num_blocks {
         let sa = i * blk_a;
-        let sb = i * blk_b;
         let ma = a_slice[sa..sa + blk_a].iter().map(|v| v.abs()).sum::<f32>() / blk_a as f32;
-        let mb = b_slice[sb..sb + blk_b].iter().map(|v| v.abs()).sum::<f32>() / blk_b as f32;
         env_a.push(ma);
-        env_b.push(mb);
     }
 
-    let actual_env_sr = (sr_a as f64) / (blk_a as f64);
+    let mut env_b = Vec::with_capacity(num_blocks);
+    if (actual_env_sr - env_sr_b).abs() <= 1e-3 {
+        let b_off = nb_b - num_blocks;
+        for i in 0..num_blocks {
+            let sb = (b_off + i) * blk_b;
+            let mb = b_slice[sb..sb + blk_b].iter().map(|v| v.abs()).sum::<f32>() / blk_b as f32;
+            env_b.push(mb);
+        }
+    } else {
+        let mut raw_env_b = Vec::with_capacity(nb_b);
+        for i in 0..nb_b {
+            let sb = i * blk_b;
+            let mb = b_slice[sb..sb + blk_b].iter().map(|v| v.abs()).sum::<f32>() / blk_b as f32;
+            raw_env_b.push(mb);
+        }
+        let last_b = (nb_b - 1) as f64;
+        for i in 0..num_blocks {
+            let bins_from_tail = (num_blocks - 1 - i) as f64;
+            let src = (last_b - bins_from_tail * rate_ratio).clamp(0.0, last_b);
+            let idx0 = src.floor() as usize;
+            let idx1 = (idx0 + 1).min(nb_b - 1);
+            let frac = (src - idx0 as f64) as f32;
+            env_b.push(raw_env_b[idx0] * (1.0 - frac) + raw_env_b[idx1] * frac);
+        }
+    }
 
     // Gunakan kombinasi Onset (turunan positif awal suku kata) + Envelope agar ekor Reverb panjang
     // (seperti 2x FabFilter Pro-R di Line B) dan background noise loop tidak menggeser puncak korelasi ke belakang!
@@ -419,20 +446,26 @@ pub fn estimate_latency_ms(probe_a: &LatencyProbe, probe_b: &LatencyProbe, max_l
     let mean_a = env_a.iter().sum::<f32>() / num_blocks as f32;
     let mean_b = env_b.iter().sum::<f32>() / num_blocks as f32;
 
-    let mut norm_a = 0.0f32;
-    let mut norm_b = 0.0f32;
+    let mut prefix_a2 = vec![0.0f64; num_blocks + 1];
+    let mut prefix_b2 = vec![0.0f64; num_blocks + 1];
     for i in 0..num_blocks {
         env_a[i] -= mean_a;
         env_b[i] -= mean_b;
-        norm_a += env_a[i] * env_a[i];
-        norm_b += env_b[i] * env_b[i];
+        let ea2 = (env_a[i] as f64) * (env_a[i] as f64);
+        let eb2 = (env_b[i] as f64) * (env_b[i] as f64);
+        prefix_a2[i + 1] = prefix_a2[i] + ea2;
+        prefix_b2[i + 1] = prefix_b2[i] + eb2;
     }
-    let denom = (norm_a * norm_b).sqrt();
-    if denom < 1e-6 {
+    let norm_a = prefix_a2[num_blocks];
+    let norm_b = prefix_b2[num_blocks];
+    if (norm_a * norm_b).sqrt() < 1e-6 {
         return None;
     }
 
-    let max_lag = (((max_lag_ms / 1000.0) * actual_env_sr) as usize).min(num_blocks.saturating_sub(1));
+    // Sisakan overlap minimal 60 bin (~150ms) agar normalisasi lokal tidak meledak di ujung buffer
+    let min_overlap = 60usize.min(num_blocks / 3).max(16);
+    let max_valid_lag = num_blocks.saturating_sub(min_overlap);
+    let max_lag = (((max_lag_ms / 1000.0) * actual_env_sr).round() as usize).min(max_valid_lag);
     if max_lag == 0 {
         return None;
     }
@@ -442,9 +475,11 @@ pub fn estimate_latency_ms(probe_a: &LatencyProbe, probe_b: &LatencyProbe, max_l
         fft_size *= 2;
     }
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft_fwd = planner.plan_fft_forward(fft_size);
-    let fft_inv = planner.plan_fft_inverse(fft_size);
+    static GLOBAL_FFT_PLANNER: std::sync::OnceLock<Mutex<FftPlanner<f32>>> = std::sync::OnceLock::new();
+    let (fft_fwd, fft_inv) = {
+        let mut planner = GLOBAL_FFT_PLANNER.get_or_init(|| Mutex::new(FftPlanner::<f32>::new())).lock();
+        (planner.plan_fft_forward(fft_size), planner.plan_fft_inverse(fft_size))
+    };
 
     let mut fx = vec![Complex::new(0.0f32, 0.0f32); fft_size];
     let mut fy = vec![Complex::new(0.0f32, 0.0f32); fft_size];
@@ -461,50 +496,89 @@ pub fn estimate_latency_ms(probe_a: &LatencyProbe, probe_b: &LatencyProbe, max_l
     }
     fft_inv.process(&mut fy);
 
-    // Cari lag kausal terbaik (0..=max_lag, di mana Out B tertunda setelah In A).
-    // Gunakan bobot prioritas kausal agar suku kata berulang (mis. pada lag 800-1000ms)
-    // tidak pernah mengalahkan puncak delay suara pertama yang sesungguhnya (30..550ms)!
+    // Hitung korelasi ternormalisasi bebas-bias berdasarkan energi overlap lokal `sqrt(E_a[0..N-lag] * E_b[lag..N])`
+    // agar lag panjang (500..1200ms) tidak kehilangan 50-80% skor kepercayaan dibanding lag pendek!
+    let mut corr_norm = vec![0.0f64; max_lag + 1];
+    let min_e_a = norm_a * 0.05;
+    let min_e_b = norm_b * 0.05;
+    for lag in 0..=max_lag {
+        let raw_val = (fy[lag].re as f64) / (fft_size as f64);
+        let e_a = prefix_a2[num_blocks - lag];
+        let e_b = prefix_b2[num_blocks] - prefix_b2[lag];
+        if e_a >= min_e_a && e_b >= min_e_b {
+            let local_denom = (e_a * e_b).sqrt();
+            if local_denom > 1e-9 {
+                corr_norm[lag] = (raw_val / local_denom).clamp(-1.0, 1.0);
+            }
+        }
+    }
+
+    // Cari lag kausal terbaik (min_lag..=max_lag, di mana Out B tertunda setelah In A).
+    // Gunakan bobot prioritas kausal ringan agar suku kata berulang tidak mengalahkan puncak pertama.
     let min_lag = ((0.015 * actual_env_sr).round() as usize).min(max_lag);
-    let mut best_val = f32::NEG_INFINITY;
+    let mut best_score = f64::NEG_INFINITY;
     let mut best_lag: usize = min_lag;
 
     for lag in min_lag..=max_lag {
-        let raw_val = fy[lag].re / (fft_size as f32);
-        let lag_ms = (lag as f32) / (actual_env_sr as f32) * 1000.0;
-        let causal_weight = 1.0 - 0.18 * (lag_ms / 1500.0).clamp(0.0, 1.0);
-        let weighted = raw_val * causal_weight;
-        if weighted > best_val {
-            best_val = weighted;
+        let c = corr_norm[lag];
+        let lag_ms = (lag as f64) / actual_env_sr * 1000.0;
+        let causal_weight = 1.0 - 0.08 * (lag_ms / 1500.0).clamp(0.0, 1.0);
+        let weighted = c * causal_weight;
+        if weighted > best_score {
+            best_score = weighted;
             best_lag = lag;
         }
     }
 
-    // Jika puncak global jatuh di atas 580ms (sering kali korelasi antar suku kata berikutnya),
-    // periksa apakah sudah ada puncak lokal yang kuat (>= 78% puncak) di rentang realistis 25..550ms!
+    // Jika puncak global jatuh di atas batas realistis dinamis, prioritaskan puncak korelasi sah pertama
+    // di dalam rentang realistis menggunakan ambang kepercayaan yang konsisten (`MIN_CONFIDENCE`).
+    const MIN_CONFIDENCE: f64 = 0.20;
+    let eff_ceiling_ms = if realistic_ceiling_ms.is_finite() {
+        realistic_ceiling_ms.clamp(250.0, max_lag_ms.max(250.0))
+    } else {
+        max_lag_ms.max(250.0)
+    };
     let best_lag_ms = (best_lag as f64) / actual_env_sr * 1000.0;
-    if best_lag_ms > 580.0 {
-        let realistic_max_lag = ((0.550 * actual_env_sr).round() as usize).min(max_lag);
-        let mut early_best_val = f32::NEG_INFINITY;
+    if best_lag_ms > eff_ceiling_ms {
+        let realistic_max_lag = (((eff_ceiling_ms / 1000.0) * actual_env_sr).round() as usize).min(max_lag);
+        let mut early_best_val = f64::NEG_INFINITY;
         let mut early_best_lag = min_lag;
         for lag in min_lag..=realistic_max_lag {
-            let raw_val = fy[lag].re / (fft_size as f32);
-            if raw_val > early_best_val {
-                early_best_val = raw_val;
+            let c = corr_norm[lag];
+            if c > early_best_val {
+                early_best_val = c;
                 early_best_lag = lag;
             }
         }
-        if early_best_val >= best_val * 0.78 && (early_best_val / denom) >= 0.20 {
+        if early_best_val >= corr_norm[best_lag] * 0.55 && early_best_val >= MIN_CONFIDENCE {
             best_lag = early_best_lag;
-            best_val = early_best_val;
         }
     }
 
-    let confidence = best_val / denom;
-    if confidence < 0.20 {
+    let confidence = corr_norm[best_lag];
+    if confidence < MIN_CONFIDENCE {
         return None;
     }
 
-    Some((best_lag as f64) / actual_env_sr * 1000.0)
+    // 3-point parabolic sub-bin interpolation untuk akurasi < ±0.3 ms (menghilangkan kuantisasi bin 2.5 ms)
+    let mut refined_lag = best_lag as f64;
+    if best_lag > min_lag && best_lag < max_lag {
+        let ym = corr_norm[best_lag - 1];
+        let y0 = corr_norm[best_lag];
+        let yp = corr_norm[best_lag + 1];
+        let denom_p = ym - 2.0 * y0 + yp;
+        if denom_p < -1e-9 {
+            let delta = (0.5 * (ym - yp) / denom_p).clamp(-0.5, 0.5);
+            refined_lag += delta;
+        }
+    }
+
+    let raw_ms = (refined_lag / actual_env_sr) * 1000.0;
+    let corrected_ms = raw_ms - dt_skew_ms;
+    if !corrected_ms.is_finite() || corrected_ms < 5.0 {
+        return None;
+    }
+    Some(corrected_ms)
 }
 
 // ==============================================================================
@@ -579,14 +653,41 @@ impl AudioOverlayPlayer {
             r = resample_channel(&r, src_sr, target_sample_rate);
         }
 
-        // Crossfade 80.0 ms di ujung loop agar pemutaran berulang mulus tanpa klik
+        // 1. Pangkas padding hening MP3/WAV di awal & akhir file (maks 150ms) agar file noise tidak terputus
+        let max_trim = ((target_sample_rate as usize) * 150) / 1000;
+        let thr_sil = 1.5e-4f32;
+        let total_raw = l.len().min(r.len());
+        if total_raw > max_trim * 4 {
+            let mut head_trim = 0usize;
+            while head_trim < max_trim && l[head_trim].abs() < thr_sil && r[head_trim].abs() < thr_sil {
+                head_trim += 1;
+            }
+            let mut tail_trim = 0usize;
+            while tail_trim < max_trim
+                && l[total_raw - 1 - tail_trim].abs() < thr_sil
+                && r[total_raw - 1 - tail_trim].abs() < thr_sil
+            {
+                tail_trim += 1;
+            }
+            if head_trim > 0 || tail_trim > 0 {
+                let keep_end = total_raw.saturating_sub(tail_trim);
+                if keep_end > head_trim + 1024 {
+                    l = l[head_trim..keep_end].to_vec();
+                    r = r[head_trim..keep_end].to_vec();
+                }
+            }
+        }
+
+        // 2. Equal-Power Cosine/Sine Loop Crossfade 250.0 ms (`cos^2 + sin^2 == 1.0000`):
+        //    Menjamin daya RMS 100% konstan (0.00 dB dip) saat memutar ulang file background noise / room tone!
         let total = l.len().min(r.len());
-        let cf_n = (((target_sample_rate as f64) * 0.080) as usize).min(total / 4);
-        if cf_n > 8 {
+        let cf_n = (((target_sample_rate as f64) * 0.250) as usize).min(total / 4);
+        if cf_n > 16 {
             for i in 0..cf_n {
-                let t = i as f32 / (cf_n - 1) as f32;
-                let fade_out = 1.0 - t;
-                let fade_in = t;
+                let t = (i as f32) / ((cf_n - 1) as f32);
+                let angle = 0.5 * std::f32::consts::PI * t;
+                let fade_out = angle.cos();
+                let fade_in = angle.sin();
                 l[i] = l[total - cf_n + i] * fade_out + l[i] * fade_in;
                 r[i] = r[total - cf_n + i] * fade_out + r[i] * fade_in;
             }
@@ -714,7 +815,7 @@ fn decode_audio_file(path: &str) -> Result<(Vec<f32>, Vec<f32>, u32), String> {
                     right.push(s);
                 }
             } else {
-                for chunk in samples.chunks(ch_count) {
+                for chunk in samples.chunks_exact(ch_count) {
                     left.push(chunk[0]);
                     right.push(chunk[1]);
                 }

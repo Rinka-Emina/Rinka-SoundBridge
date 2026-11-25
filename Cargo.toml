@@ -1,9 +1,9 @@
 [package]
 name = "rinka_soundbridge"
-version = "2.0.0"
+version = "2.3.0"
 edition = "2021"
 authors = ["Rinka VTuber Project"]
-description = "Rinka SoundBridge v2.0 - Full Native Rust Dual-Line Audio Router (WASAPI Shared, WASAPI Exclusive & ASIO Native) & VST3 Host"
+description = "Rinka SoundBridge v2.3 (NEON) - Full Native Rust Dual-Line Audio Router (WASAPI Shared, WASAPI Exclusive & ASIO Native), Lock-Free SPSC FIFO & VST3 Host"
 
 [lib]
 name = "rinka_soundbridge_core"

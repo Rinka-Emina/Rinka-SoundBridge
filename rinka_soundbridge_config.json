@@ -15,7 +15,9 @@
     "asio_set_in_enabled": false,
     "asio_set_in_latency": 0.0,
     "asio_set_out_enabled": false,
-    "asio_set_out_latency": 0.0
+    "asio_set_out_latency": 0.0,
+    "auto_reset_enabled": true,
+    "auto_reset_interval_mins": 10
   },
   "line_a": {
     "is_enabled": true,
@@ -152,6 +154,8 @@
     "wasapi_out_set": true,
     "wasapi_out_exclusive": false,
     "wasapi_out_autoconvert": true,
-    "out_channels": 0
+    "out_channels": 0,
+    "auto_reset_enabled": true,
+    "auto_reset_interval_mins": 10
   }
 }

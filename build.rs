@@ -7,11 +7,13 @@ fn main() {
         if std::path::Path::new("icon.ico").exists() {
             let mut res = winres::WindowsResource::new();
             res.set_icon("icon.ico");
-            res.set("ProductName", "Rinka SoundBridge v2.0");
+            res.set("ProductName", "Rinka SoundBridge v2.3 (NEON)");
             res.set(
                 "FileDescription",
-                "Rinka SoundBridge v2.0 (Rust Native) - WASAPI Shared/Exclusive, ASIO & VST3 Host",
+                "Rinka SoundBridge v2.3 (NEON) - Lock-Free SPSC Audio Router, WASAPI Shared/Exclusive, ASIO & VST3 Host",
             );
+            res.set("ProductVersion", "2.3.0.0");
+            res.set("FileVersion", "2.3.0.0");
             let _ = res.compile();
         }
     }

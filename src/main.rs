@@ -1,6 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! Rinka SoundBridge v2.0 2026.10 (Rust Native Edition)
-//! Desain UI identik 1:1 dengan Rinka SoundBridge v1.22 (Windows 11 Dark):
+//! Rinka SoundBridge v2.3 NEON (Rust Native Edition — Lock-Free SPSC Engine & Synchronized ORION NEON IPC)
+//! Desain UI identik 1:1 dengan Rinka SoundBridge (Windows 11 Dark):
 //! - Font native Windows Segoe UI (tanpa kotak-kotak/tofu) + Ikon Vektor Presisi
 //! - GroupBox bergaya PyQt6 dengan judul di atas garis border
 //! - Kotak wadah VST Chain besar (#232323) yang selalu tampil utuh + tombol penuh "+ Add VST3"
@@ -13,8 +13,8 @@ use eframe::egui::{
     Rect, Response, RichText, Rounding, Sense, Shape, Stroke, Vec2,
 };
 use rinka_soundbridge_core::asio_host::{
-    asio_diag_poll, ensure_asio_requirements_installed, get_dsp_rsb_bus_b_in, open_asio_control_panel,
-    read_user_flexasio_toml_devices,
+    asio_diag_poll, ensure_asio_requirements_installed, get_dsp_rsb_bus_a_out, get_dsp_rsb_bus_b_in,
+    open_asio_control_panel, read_orion_gpu_telemetry_shm_only, read_user_flexasio_toml_devices,
     register_virtual_asio_drivers, register_virtual_asio_drivers_with_settings, AsioDriverInfo,
     AsioRegistrationSettings, DSP_RSB_ASIO_DRIVER_NAME, RINKA_ASIO_DRIVER_NAME, RSB_ASIO_DRIVER_NAME,
 };
@@ -23,17 +23,24 @@ use rinka_soundbridge_core::config::{
     AppConfig, DspRsbAsioConfig, FlexAsioProfileConfig, LineConfig, OverlaySlotConfig, RsbAsioConfig,
     VstSlotConfig, DEFAULT_ASIO_NOTES_TEXT,
 };
-use rinka_soundbridge_core::dsp::estimate_latency_ms;
+use rinka_soundbridge_core::dsp::estimate_latency_ms_with_ceiling;
 use rinka_soundbridge_core::logger::{
-    install_crash_handlers, log_error, log_info, shutdown_logger,
+    get_savedata_dir, install_crash_handlers, log_error, log_info, shutdown_logger,
 };
 use rinka_soundbridge_core::pipeline::{
-    get_asio_devices, get_wasapi_devices, normalize_virtual_device_name, AudioPipeline, DriverBackend, WasapiDeviceInfo,
+    get_asio_devices, get_wasapi_devices, normalize_virtual_device_name, AudioPipeline,
+    AutoResetCoordinator, AutoResetTransport, DriverBackend, WasapiDeviceInfo,
 };
 use rinka_soundbridge_core::vst3_host::VSTScanner;
 use rinka_soundbridge_core::win32::{
-    acquire_single_instance, boost_process_priority, capture_host_gl_context, enable_cpu_denormal_flush, get_audio_priority_boost, get_logical_cpu_count, restore_host_gl_context,
-    get_main_window_rect, is_tray_quit_requested, open_file_in_notepad, poll_gpu_clock_telemetry_with_failsafe, release_single_instance, reset_gpu_boost_clock_lock_on_exit, restore_main_window_pos, set_asio_cpu_cores, set_audio_priority_boost, set_gpu_boost_clock_lock_with_failsafe, show_info_message_box, take_gpu_failsafe_alert, trim_process_working_set, GpuTelemetrySnapshot, ProcessPerfMonitor, SystemTrayManager,
+    acquire_single_instance, boost_process_priority, capture_host_gl_context, enable_cpu_denormal_flush,
+    ensure_igpu_power_saving_preference_if_unset, get_audio_priority_boost, get_logical_cpu_count,
+    get_main_window_rect, is_main_window_hidden_or_minimized, is_tray_quit_requested,
+    mark_clean_shutdown_complete, open_file_in_notepad, poll_gpu_clock_telemetry_with_failsafe,
+    release_single_instance, reset_gpu_boost_clock_lock_on_exit, restore_main_window_pos,
+    set_asio_cpu_cores, set_audio_priority_boost, set_gpu_boost_clock_lock_with_failsafe,
+    show_info_message_box, take_gpu_failsafe_alert, trim_process_working_set,
+    unlock_gpu_clocks_quiet_on_startup, GpuTelemetrySnapshot, ProcessPerfMonitor, SystemTrayManager,
 };
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -41,7 +48,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const APP_WINDOW_TITLE: &str = "Rinka SoundBridge v2.0 Beta2";
+pub const APP_WINDOW_TITLE: &str = "Rinka SoundBridge v2.3";
 
 const APP_ICON_RGBA: [u8; 4096] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 127, 127, 255, 2, 0, 0, 0, 5, 86, 100, 106, 192, 63, 72, 78, 88, 0, 0, 0, 0, 85, 85, 85, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 127, 127, 4, 0, 0, 0, 0, 60, 68, 72, 130, 166, 215, 240, 255, 108, 134, 145, 210, 0, 0, 0, 5, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 85, 85, 85, 3, 2, 2, 2, 0, 28, 28, 24, 53, 115, 146, 162, 254, 116, 185, 228, 250, 125, 165, 185, 255, 24, 19, 14, 53, 0, 0, 1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 2, 3, 3, 0, 0, 0, 0, 11, 88, 103, 110, 184, 62, 72, 79, 74, 0, 0, 0, 0, 85, 85, 85, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 170, 255, 255, 3, 0, 0, 0, 5, 96, 113, 123, 207, 122, 178, 212, 255, 104, 174, 216, 248, 137, 190, 218, 255, 79, 83, 81, 119, 0, 0, 0, 0, 127, 127, 127, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 63, 63, 63, 4, 3, 3, 3, 0, 0, 0, 0, 14, 87, 104, 114, 192, 154, 204, 229, 255, 67, 84, 88, 109, 0, 0, 0, 0, 63, 127, 127, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 127, 127, 4, 0, 0, 0, 0, 72, 80, 82, 133, 136, 175, 199, 255, 107, 173, 214, 251, 111, 177, 217, 252, 134, 195, 230, 255, 110, 125, 128, 187, 0, 0, 0, 0, 255, 255, 255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 127, 127, 4, 0, 0, 0, 0, 0, 0, 0, 34, 115, 131, 136, 203, 139, 186, 214, 255, 117, 177, 211, 252, 65, 79, 81, 109, 0, 0, 0, 0, 63, 127, 127, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 85, 85, 3, 2, 3, 3, 0, 23, 18, 18, 55, 147, 164, 171, 253, 116, 176, 213, 252, 101, 168, 208, 254, 103, 159, 196, 254, 124, 191, 229, 255, 134, 156, 165, 237, 0, 0, 0, 18, 1, 2, 3, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 255, 255, 255, 1, 0, 0, 0, 0, 27, 30, 30, 83, 164, 172, 172, 234, 194, 225, 241, 255, 100, 165, 205, 247, 130, 191, 224, 255, 76, 93, 97, 123, 0, 0, 0, 0, 127, 127, 127, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 2, 0, 0, 0, 7, 136, 137, 136, 210, 174, 197, 217, 255, 88, 132, 168, 252, 161, 189, 209, 255, 156, 180, 199, 255, 97, 167, 211, 255, 145, 174, 189, 255, 36, 18, 6, 42, 0, 0, 0, 2, 0, 0, 0, 4, 0, 0, 0, 3, 1, 1, 1, 0, 0, 0, 0, 0, 75, 76, 78, 136, 203, 205, 206, 255, 235, 244, 251, 255, 103, 153, 187, 252, 107, 171, 211, 251, 134, 192, 224, 255, 89, 99, 103, 126, 0, 0, 0, 0, 127, 127, 127, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 127, 127, 4, 1, 1, 1, 0, 70, 70, 68, 115, 216, 222, 229, 255, 157, 176, 198, 251, 218, 224, 229, 255, 252, 253, 255, 255, 211, 219, 227, 255, 116, 156, 188, 252, 145, 179, 198, 255, 47, 38, 34, 119, 1, 1, 1, 0, 3, 3, 3, 0, 1, 1, 1, 0, 3, 6, 3, 82, 89, 91, 92, 196, 230, 232, 235, 255, 255, 255, 255, 253, 148, 168, 187, 253, 166, 187, 204, 255, 115, 165, 201, 251, 139, 193, 225, 255, 92, 92, 92, 121, 0, 0, 0, 0, 127, 127, 127, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 2, 0, 0, 0, 17, 165, 166, 167, 234, 204, 217, 232, 254, 183, 198, 216, 253, 255, 255, 255, 255, 242, 246, 252, 255, 255, 255, 255, 255, 185, 202, 217, 253, 152, 188, 211, 255, 116, 116, 114, 222, 0, 0, 0, 50, 0, 0, 0, 36, 0, 0, 0, 57, 161, 163, 164, 247, 255, 255, 255, 255, 255, 255, 255, 251, 207, 216, 225, 255, 193, 206, 220, 255, 245, 246, 247, 255, 110, 153, 186, 251, 140, 185, 211, 255, 88, 80, 75, 98, 0, 0, 0, 0, 63, 63, 63, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 63, 63, 63, 4, 1, 1, 1, 0, 54, 56, 56, 103, 240, 241, 244, 255, 193, 205, 217, 251, 175, 191, 211, 255, 222, 232, 244, 255, 227, 235, 243, 255, 214, 222, 230, 255, 181, 194, 209, 255, 184, 200, 215, 255, 196, 205, 211, 255, 157, 168, 180, 255, 157, 169, 179, 251, 156, 165, 172, 254, 225, 232, 238, 255, 214, 224, 232, 252, 235, 241, 244, 255, 164, 179, 199, 255, 206, 218, 232, 255, 249, 251, 253, 255, 223, 232, 239, 254, 137, 154, 167, 255, 33, 29, 20, 61, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 2, 0, 0, 0, 26, 114, 117, 119, 200, 255, 255, 255, 254, 211, 220, 229, 252, 184, 200, 224, 255, 180, 197, 221, 255, 175, 190, 208, 255, 209, 218, 227, 255, 248, 250, 252, 255, 219, 227, 235, 255, 179, 197, 214, 254, 232, 241, 248, 255, 249, 255, 255, 255, 217, 228, 239, 255, 191, 205, 217, 254, 229, 235, 239, 255, 194, 204, 215, 255, 159, 177, 203, 255, 200, 216, 235, 255, 240, 243, 247, 254, 209, 225, 239, 255, 126, 144, 155, 233, 0, 0, 0, 16, 1, 2, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 63, 63, 63, 4, 1, 1, 1, 0, 46, 46, 46, 160, 178, 179, 182, 255, 255, 255, 255, 251, 165, 180, 198, 255, 158, 178, 203, 255, 192, 204, 217, 255, 244, 247, 250, 255, 255, 255, 255, 255, 188, 205, 218, 255, 149, 174, 197, 255, 200, 213, 225, 255, 236, 241, 245, 255, 248, 249, 252, 254, 215, 224, 233, 254, 168, 189, 206, 255, 168, 188, 206, 255, 250, 252, 254, 255, 210, 219, 230, 255, 168, 186, 210, 255, 239, 243, 250, 253, 195, 213, 227, 255, 80, 89, 95, 216, 0, 0, 0, 12, 255, 255, 255, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 3, 0, 0, 0, 0, 122, 124, 125, 166, 255, 255, 255, 254, 255, 255, 255, 251, 173, 188, 203, 255, 187, 199, 212, 255, 255, 255, 255, 255, 251, 253, 255, 255, 201, 213, 224, 255, 176, 191, 208, 255, 247, 250, 252, 255, 251, 252, 255, 255, 247, 249, 255, 255, 244, 247, 253, 255, 250, 252, 255, 255, 255, 255, 255, 255, 200, 212, 224, 255, 189, 201, 214, 255, 255, 255, 255, 255, 209, 218, 227, 255, 170, 187, 202, 253, 151, 187, 210, 255, 112, 116, 116, 219, 0, 0, 0, 19, 255, 255, 255, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 1, 23, 23, 23, 11, 97, 98, 98, 202, 255, 254, 254, 255, 229, 235, 241, 253, 198, 208, 218, 255, 255, 255, 255, 255, 246, 249, 253, 255, 240, 245, 250, 255, 212, 219, 228, 255, 253, 255, 255, 255, 227, 233, 238, 255, 232, 237, 243, 255, 247, 250, 255, 255, 245, 247, 252, 255, 245, 248, 253, 255, 224, 230, 237, 255, 250, 253, 255, 255, 223, 230, 237, 255, 232, 238, 245, 255, 255, 255, 255, 255, 172, 193, 210, 251, 169, 199, 218, 255, 90, 85, 80, 146, 0, 0, 0, 0, 127, 127, 127, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 3, 3, 0, 0, 0, 0, 14, 128, 133, 141, 238, 254, 255, 255, 255, 194, 205, 215, 254, 240, 244, 248, 255, 252, 252, 254, 255, 248, 250, 253, 255, 235, 242, 248, 255, 249, 253, 255, 255, 246, 250, 254, 255, 211, 220, 229, 255, 245, 248, 252, 255, 246, 249, 254, 255, 244, 247, 252, 255, 250, 252, 255, 255, 227, 234, 239, 255, 225, 231, 238, 255, 253, 255, 255, 255, 237, 243, 248, 255, 249, 250, 251, 254, 255, 255, 255, 254, 146, 152, 158, 244, 55, 51, 51, 64, 170, 255, 255, 3, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 63, 63, 63, 4, 0, 0, 0, 0, 38, 41, 44, 86, 177, 191, 205, 254, 207, 218, 228, 252, 227, 233, 238, 255, 249, 251, 255, 255, 246, 249, 254, 255, 238, 242, 248, 255, 232, 238, 244, 255, 252, 254, 254, 255, 236, 241, 248, 255, 200, 210, 220, 255, 254, 255, 255, 255, 247, 249, 252, 255, 244, 247, 253, 255, 253, 254, 255, 255, 242, 245, 247, 255, 218, 227, 233, 255, 254, 255, 255, 255, 233, 239, 246, 255, 236, 240, 245, 255, 255, 255, 255, 253, 200, 202, 205, 249, 7, 7, 7, 66, 1, 1, 1, 0, 85, 85, 85, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 2, 18, 18, 18, 14, 80, 87, 100, 186, 199, 212, 228, 255, 231, 236, 241, 252, 247, 249, 253, 255, 243, 247, 252, 255, 249, 252, 255, 255, 211, 219, 230, 255, 232, 236, 244, 255, 255, 255, 255, 255, 194, 196, 204, 255, 175, 176, 184, 255, 255, 255, 255, 255, 244, 246, 251, 255, 244, 248, 253, 255, 248, 250, 253, 255, 247, 249, 252, 255, 171, 179, 187, 255, 246, 249, 253, 255, 228, 234, 242, 255, 203, 215, 228, 255, 245, 248, 253, 253, 255, 255, 255, 255, 164, 167, 170, 236, 0, 0, 0, 47, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 255, 255, 255, 1, 18, 20, 20, 112, 145, 155, 168, 255, 208, 221, 234, 252, 200, 212, 226, 255, 240, 244, 248, 255, 247, 250, 255, 255, 241, 245, 250, 255, 195, 206, 218, 255, 247, 253, 255, 255, 215, 224, 230, 255, 180, 148, 147, 255, 189, 181, 187, 255, 247, 254, 255, 255, 244, 246, 252, 255, 239, 244, 250, 255, 243, 247, 253, 255, 240, 249, 255, 255, 160, 143, 147, 255, 206, 203, 207, 255, 243, 253, 255, 255, 177, 193, 210, 255, 238, 242, 248, 255, 240, 243, 248, 254, 218, 228, 238, 255, 163, 168, 172, 255, 64, 64, 64, 122, 23, 23, 23, 11, 255, 255, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 102, 102, 102, 5, 2, 2, 2, 0, 59, 61, 61, 108, 216, 220, 227, 255, 204, 215, 228, 252, 183, 196, 210, 255, 249, 251, 255, 255, 247, 250, 255, 255, 232, 236, 243, 255, 195, 212, 230, 255, 198, 209, 219, 255, 174, 153, 155, 255, 247, 212, 202, 255, 183, 174, 177, 255, 206, 219, 229, 255, 244, 246, 251, 255, 233, 240, 247, 255, 243, 247, 252, 255, 202, 215, 226, 255, 203, 178, 178, 255, 196, 164, 160, 255, 209, 217, 223, 255, 197, 211, 228, 255, 214, 222, 231, 254, 255, 255, 255, 255, 147, 150, 155, 244, 93, 98, 102, 156, 67, 67, 69, 132, 0, 0, 0, 13, 255, 255, 255, 1, 0, 0, 0, 0, 51, 51, 51, 5, 5, 5, 5, 0, 0, 0, 0, 27, 164, 166, 170, 237, 255, 255, 255, 254, 236, 240, 246, 254, 212, 220, 229, 255, 249, 251, 255, 255, 249, 251, 255, 255, 224, 232, 240, 255, 155, 163, 182, 255, 197, 174, 175, 255, 255, 241, 233, 255, 228, 218, 210, 255, 151, 132, 132, 255, 144, 155, 170, 255, 230, 241, 248, 255, 238, 243, 248, 255, 218, 230, 241, 255, 129, 134, 148, 255, 164, 144, 142, 255, 247, 223, 214, 255, 200, 182, 182, 255, 159, 176, 196, 255, 213, 222, 233, 255, 251, 255, 255, 254, 188, 192, 195, 252, 0, 0, 0, 26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 125, 125, 124, 195, 252, 255, 255, 255, 235, 241, 246, 253, 218, 226, 237, 255, 206, 216, 228, 255, 247, 250, 254, 255, 250, 254, 255, 255, 210, 212, 218, 255, 201, 175, 170, 255, 169, 139, 132, 255, 157, 133, 129, 255, 223, 208, 201, 255, 252, 232, 223, 255, 159, 160, 167, 255, 145, 158, 172, 255, 230, 242, 255, 255, 153, 163, 180, 255, 150, 143, 149, 255, 247, 233, 225, 255, 199, 181, 176, 255, 145, 111, 106, 255, 153, 135, 138, 255, 215, 220, 227, 255, 235, 244, 253, 251, 221, 230, 236, 255, 45, 51, 62, 123, 255, 255, 255, 1, 51, 102, 102, 5, 0, 0, 0, 0, 85, 85, 85, 6, 38, 38, 38, 79, 132, 136, 141, 218, 235, 244, 252, 255, 200, 213, 227, 252, 239, 245, 251, 255, 209, 220, 231, 255, 216, 226, 236, 255, 242, 246, 251, 255, 242, 249, 254, 255, 215, 216, 221, 255, 222, 206, 199, 255, 182, 161, 156, 255, 116, 84, 82, 255, 100, 69, 66, 255, 143, 112, 108, 255, 202, 182, 175, 255, 187, 174, 173, 255, 169, 174, 185, 255, 165, 163, 167, 255, 206, 179, 171, 255, 129, 101, 98, 255, 100, 68, 65, 255, 160, 137, 132, 255, 220, 201, 196, 255, 211, 214, 220, 255, 212, 225, 237, 253, 195, 209, 222, 254, 131, 137, 144, 231, 0, 0, 0, 16, 1, 2, 2, 0, 0, 0, 0, 2, 0, 0, 0, 9, 43, 43, 47, 135, 124, 131, 138, 188, 74, 83, 93, 208, 186, 196, 208, 255, 241, 248, 251, 254, 195, 208, 220, 255, 237, 241, 247, 255, 218, 226, 234, 255, 233, 242, 249, 255, 224, 228, 235, 255, 206, 194, 192, 255, 255, 252, 244, 255, 219, 202, 195, 255, 133, 105, 102, 255, 40, 2, 2, 255, 129, 100, 96, 255, 255, 253, 244, 255, 237, 216, 209, 255, 234, 224, 218, 255, 132, 102, 99, 255, 44, 6, 6, 255, 151, 126, 123, 255, 234, 219, 212, 255, 198, 189, 185, 255, 180, 192, 204, 255, 191, 206, 225, 255, 142, 158, 181, 252, 245, 249, 253, 255, 129, 130, 132, 189, 15, 15, 15, 16, 255, 255, 255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 95, 102, 113, 184, 225, 239, 253, 255, 217, 228, 239, 252, 182, 196, 211, 255, 214, 225, 234, 255, 221, 229, 237, 255, 193, 206, 221, 255, 212, 225, 235, 255, 202, 195, 195, 255, 123, 87, 85, 255, 80, 39, 37, 255, 140, 105, 100, 255, 206, 187, 180, 255, 245, 227, 220, 255, 250, 233, 226, 255, 255, 241, 234, 255, 255, 242, 235, 255, 245, 227, 220, 255, 206, 186, 180, 255, 131, 91, 88, 255, 95, 52, 49, 255, 140, 122, 125, 255, 150, 167, 186, 255, 154, 173, 197, 254, 179, 194, 211, 255, 133, 134, 135, 228, 142, 144, 146, 227, 40, 40, 40, 139, 1, 1, 1, 0, 0, 0, 0, 2, 170, 255, 255, 3, 28, 28, 28, 27, 131, 154, 170, 246, 193, 219, 238, 255, 200, 215, 228, 254, 119, 158, 189, 255, 178, 204, 221, 255, 253, 255, 255, 255, 182, 198, 216, 255, 160, 180, 201, 255, 141, 144, 153, 253, 199, 155, 150, 255, 252, 203, 195, 255, 255, 215, 208, 255, 255, 232, 223, 255, 255, 242, 234, 255, 229, 207, 200, 255, 204, 178, 173, 255, 226, 203, 196, 255, 255, 239, 232, 255, 255, 231, 223, 255, 255, 213, 205, 255, 252, 201, 193, 255, 211, 173, 170, 255, 164, 140, 142, 255, 189, 199, 210, 252, 214, 230, 246, 255, 133, 138, 139, 197, 0, 0, 0, 2, 145, 145, 145, 7, 0, 0, 0, 0, 0, 0, 0, 2, 1, 2, 2, 0, 0, 0, 0, 29, 126, 164, 185, 248, 97, 123, 139, 254, 158, 188, 206, 254, 83, 153, 200, 255, 157, 191, 214, 254, 242, 254, 255, 255, 232, 247, 255, 255, 160, 169, 182, 255, 213, 173, 169, 255, 255, 213, 203, 254, 255, 198, 193, 251, 248, 193, 188, 252, 247, 219, 211, 253, 252, 236, 229, 254, 237, 215, 208, 254, 232, 210, 202, 255, 241, 221, 214, 254, 249, 232, 225, 254, 247, 220, 212, 254, 248, 197, 187, 252, 252, 197, 189, 252, 255, 218, 208, 255, 197, 164, 160, 255, 201, 209, 218, 254, 201, 221, 241, 255, 158, 172, 177, 238, 51, 51, 51, 15, 3, 3, 3, 0, 0, 0, 0, 1, 0, 0, 0, 0, 255, 255, 255, 2, 0, 0, 0, 2, 86, 117, 132, 213, 51, 67, 76, 204, 128, 160, 177, 238, 89, 158, 203, 253, 113, 166, 201, 255, 210, 242, 253, 255, 209, 240, 253, 255, 190, 207, 216, 252, 169, 128, 124, 217, 230, 187, 179, 255, 255, 229, 220, 255, 255, 244, 235, 255, 255, 248, 240, 255, 255, 240, 232, 255, 255, 239, 232, 255, 255, 242, 235, 255, 255, 243, 236, 255, 255, 242, 234, 255, 255, 247, 239, 255, 255, 247, 238, 255, 255, 236, 227, 255, 199, 172, 165, 255, 167, 166, 177, 255, 221, 237, 246, 254, 156, 180, 201, 255, 140, 164, 172, 239, 0, 0, 0, 19, 2, 3, 3, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 31, 39, 43, 65, 15, 20, 20, 101, 81, 102, 113, 137, 80, 111, 133, 255, 64, 101, 126, 247, 163, 223, 251, 254, 170, 222, 242, 251, 191, 233, 250, 254, 80, 104, 115, 95, 93, 35, 31, 57, 161, 122, 119, 139, 187, 157, 151, 194, 207, 185, 178, 227, 233, 210, 200, 244, 240, 217, 210, 255, 233, 211, 205, 255, 225, 204, 197, 252, 220, 199, 193, 247, 210, 188, 182, 230, 195, 173, 167, 193, 141, 125, 127, 166, 151, 160, 177, 251, 197, 228, 248, 253, 171, 211, 229, 251, 77, 92, 103, 255, 91, 111, 120, 203, 0, 0, 0, 1, 255, 255, 255, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 23, 25, 28, 109, 29, 35, 36, 131, 122, 183, 213, 255, 145, 220, 251, 251, 149, 216, 246, 253, 112, 153, 170, 215, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 117, 68, 58, 26, 176, 127, 121, 42, 115, 81, 75, 44, 75, 34, 34, 37, 51, 0, 0, 30, 0, 0, 0, 14, 0, 0, 0, 0, 0, 6, 39, 39, 146, 179, 201, 233, 168, 224, 250, 255, 82, 114, 130, 234, 20, 20, 22, 162, 33, 40, 46, 76, 0, 0, 0, 0, 0, 0, 85, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 127, 2, 0, 0, 0, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 9, 78, 113, 129, 227, 115, 185, 213, 255, 141, 226, 255, 255, 70, 109, 125, 212, 28, 36, 42, 90, 170, 170, 170, 6, 255, 255, 255, 4, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 3, 3, 0, 255, 255, 255, 2, 46, 53, 58, 104, 126, 173, 196, 255, 62, 88, 102, 227, 10, 8, 8, 123, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 85, 85, 6, 0, 1, 1, 0, 37, 50, 55, 96, 45, 66, 75, 173, 116, 190, 215, 221, 107, 174, 201, 228, 21, 36, 43, 35, 127, 255, 255, 2, 0, 0, 0, 2, 0, 0, 0, 1, 255, 255, 255, 1, 255, 127, 127, 2, 127, 127, 127, 2, 127, 127, 127, 2, 127, 0, 0, 2, 127, 127, 127, 2, 0, 0, 0, 0, 37, 44, 48, 115, 41, 54, 63, 93, 0, 0, 0, 12, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 127, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 37, 15, 15, 23, 32, 95, 148, 170, 163, 52, 82, 98, 111, 0, 0, 0, 0, 127, 127, 127, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 3, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -51,7 +58,6 @@ const APP_ICON_RGBA: [u8; 4096] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 
 pub struct Palette;
 
-#[allow(dead_code)]
 impl Palette {
     pub const BG_APP: Color32 = Color32::from_rgb(0x20, 0x20, 0x20);
     pub const BG_PANEL: Color32 = Color32::from_rgb(0x2C, 0x2C, 0x2C);
@@ -65,20 +71,16 @@ impl Palette {
     pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x8A, 0x8A, 0x8A);
     pub const ACCENT_PINK: Color32 = Color32::from_rgb(0x60, 0xCD, 0xFF);
     pub const ACCENT_PINK_SOFT: Color32 = Color32::from_rgb(0x24, 0x3E, 0x4F);
-    pub const ACCENT_PINK_HOVER: Color32 = Color32::from_rgb(0x78, 0xD5, 0xFF);
     pub const ACCENT_GREEN: Color32 = Color32::from_rgb(0x6C, 0xCB, 0x5F);
     pub const ACCENT_GREEN_HOVER: Color32 = Color32::from_rgb(0x84, 0xD7, 0x79);
     pub const ACCENT_GREEN_DEEP: Color32 = Color32::from_rgb(0x44, 0x9E, 0x37);
     pub const ACCENT_BLUE: Color32 = Color32::from_rgb(0x60, 0xCD, 0xFF);
-    pub const ACCENT_BLUE_HOVER: Color32 = Color32::from_rgb(0x78, 0xD5, 0xFF);
     pub const ACCENT_BLUE_DEEP: Color32 = Color32::from_rgb(0x00, 0x78, 0xD4);
     pub const ACCENT_CORAL: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
     pub const ACCENT_CORAL_HOVER: Color32 = Color32::from_rgb(0xFF, 0x85, 0x85);
     pub const ACCENT_CORAL_DEEP: Color32 = Color32::from_rgb(0xC4, 0x2B, 0x1C);
     pub const ACCENT_YELLOW: Color32 = Color32::from_rgb(0xFC, 0xE1, 0x00);
-    pub const ACCENT_YELLOW_HOVER: Color32 = Color32::from_rgb(0xFF, 0xEA, 0x4D);
     pub const ACCENT_LAVENDER: Color32 = Color32::from_rgb(0x7E, 0x8C, 0xE0);
-    pub const ACCENT_LAVENDER_HOVER: Color32 = Color32::from_rgb(0x93, 0xA0, 0xEC);
 }
 
 fn parse_hex_color(hex: &str) -> Color32 {
@@ -183,19 +185,6 @@ fn paint_group_icon(painter: &egui::Painter, center: Pos2, icon: GroupIcon) {
             );
         }
     }
-}
-
-#[allow(dead_code)]
-fn paint_no_entry_icon(painter: &egui::Painter, center: Pos2, radius: f32) {
-    painter.circle_filled(center, radius, Color32::from_rgb(0xE0, 0x43, 0x43));
-    painter.circle_stroke(center, radius, Stroke::new(1.0_f32, Color32::from_rgb(0xFF, 0x80, 0x80)));
-    painter.line_segment(
-        [
-            Pos2::new(center.x - radius * 0.55, center.y - radius * 0.55),
-            Pos2::new(center.x + radius * 0.55, center.y + radius * 0.55),
-        ],
-        Stroke::new(1.8_f32, Color32::WHITE),
-    );
 }
 
 fn paint_monitor_icon(painter: &egui::Painter, center: Pos2) {
@@ -361,62 +350,6 @@ fn draw_v122_volume_slider(ui: &mut egui::Ui, vol: &mut i32, width: f32) -> bool
     changed
 }
 
-/// Menggambar Slider Float presisi berlapis Cyan (#60CDFF) dengan kenop bulat putih bertepi biru
-/// (digunakan untuk slider Peak GPU Stall Multiplier `1.01x – 1.30x`).
-fn draw_v122_f32_slider(
-    ui: &mut egui::Ui,
-    val: &mut f32,
-    min_val: f32,
-    max_val: f32,
-    width: f32,
-) -> bool {
-    let desired = Vec2::new(width.max(60.0), 22.0);
-    let (rect, response) = ui.allocate_exact_size(desired, Sense::click_and_drag());
-    let mut changed = false;
-    let span = (max_val - min_val).max(0.001);
-
-    if response.dragged() || response.clicked() {
-        if let Some(pos) = response.interact_pointer_pos() {
-            let pad = 7.0;
-            let usable = (rect.width() - 2.0 * pad).max(1.0);
-            let t = ((pos.x - (rect.min.x + pad)) / usable).clamp(0.0, 1.0);
-            let raw = min_val + t * span;
-            let stepped = ((raw * 100.0).round() / 100.0).clamp(min_val, max_val);
-            if (stepped - *val).abs() > 1e-4 {
-                *val = stepped;
-                changed = true;
-            }
-        }
-    }
-
-    if ui.is_rect_visible(rect) {
-        let painter = ui.painter();
-        let pad = 7.0;
-        let track_y = rect.center().y;
-        let track_rect = Rect::from_min_max(
-            Pos2::new(rect.min.x + pad, track_y - 2.5),
-            Pos2::new(rect.max.x - pad, track_y + 2.5),
-        );
-        painter.rect_filled(track_rect, Rounding::same(2.5), Palette::BORDER);
-
-        let t = ((*val - min_val) / span).clamp(0.0, 1.0);
-        let handle_x = track_rect.min.x + t * track_rect.width();
-        if t > 0.0 {
-            let sub_rect = Rect::from_min_max(
-                track_rect.min,
-                Pos2::new(handle_x, track_rect.max.y),
-            );
-            painter.rect_filled(sub_rect, Rounding::same(2.5), Palette::ACCENT_PINK);
-        }
-
-        let center = Pos2::new(handle_x, track_y);
-        painter.circle_filled(center, 6.2, Color32::WHITE);
-        painter.circle_stroke(center, 6.2, Stroke::new(1.8_f32, Palette::ACCENT_PINK));
-    }
-
-    changed
-}
-
 /// Gradasi warna VU & DSP Meter: Hijau (0-60%) -> Kuning Amber (60-82%) -> Merah Peak (>82%)
 fn meter_gradient_color(t: f32) -> (u8, u8, u8) {
     if t < 0.60 {
@@ -550,7 +483,524 @@ struct VstPickerModal {
     selected_path: Option<String>,
 }
 
-pub struct RinkaSoundBridgeApp {
+pub struct ObsDelaySharedState {
+    lat_current_ms: Option<f64>,
+    lat_peak_ms: Option<f64>,
+    lat_last_updated: Instant,
+    lat_last_auto_reset: Instant,
+    est_a_ms: Option<f64>,
+    est_b_ms: Option<f64>,
+    hw_dma_ms: f64,
+    driver_backend: DriverBackend,
+    sample_rate_b: u32,
+    streams_running: bool,
+    current_display_str: String,
+    last_js_write: Instant,
+}
+
+impl ObsDelaySharedState {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            lat_current_ms: None,
+            lat_peak_ms: None,
+            lat_last_updated: now,
+            lat_last_auto_reset: now,
+            est_a_ms: None,
+            est_b_ms: None,
+            hw_dma_ms: 10.67,
+            driver_backend: DriverBackend::WasapiShared,
+            sample_rate_b: 48000,
+            streams_running: false,
+            current_display_str: "-- ms".to_string(),
+            last_js_write: now.checked_sub(Duration::from_secs(10)).unwrap_or(now),
+        }
+    }
+
+    fn structural_floor_and_parts(&self) -> (f64, f64, Option<f64>) {
+        let is_dsp_rsb = self.driver_backend == DriverBackend::AsioDspRsb;
+        let is_orion_direct = self.driver_backend == DriverBackend::OrionDirect;
+        let is_rsb_asio = self.driver_backend == DriverBackend::RsbAsio;
+        let bridge_cush_ms = if is_dsp_rsb || is_rsb_asio {
+            let sr_f = self.sample_rate_b.max(44100) as f64;
+            let bus_a = get_dsp_rsb_bus_a_out();
+            let bus_b = get_dsp_rsb_bus_b_in();
+            // Bug #2 fix: gate `bus_a` physical fill on `is_vc_active()` so stopped/reloading
+            // ORION/VC never saturates `bus_a` fill to 1000 ms (~1110 ms stale estimate!).
+            let bus_a_fill_ms = if bus_a.is_writer_active() && bus_a.is_vc_active() {
+                bus_a.get_physical_fill_ms() as f64
+            } else {
+                0.0
+            };
+            let bus_b_fill_ms = if bus_b.is_writer_active() {
+                bus_b.get_physical_fill_ms() as f64
+            } else {
+                let (c_smp, _) = bus_b.get_dsp_b_params();
+                let eff_smp = if is_rsb_asio && c_smp == 0 { 2400 } else { c_smp };
+                (eff_smp as f64 / sr_f) * 1000.0
+            };
+            Some(bus_a_fill_ms + bus_b_fill_ms)
+        } else if is_orion_direct {
+            let bus_a = get_dsp_rsb_bus_a_out();
+            let bus_b = get_dsp_rsb_bus_b_in();
+            let bus_a_fill_ms = if bus_a.is_writer_active() && bus_a.is_vc_active() {
+                bus_a.get_physical_fill_ms() as f64
+            } else {
+                0.0
+            };
+            // OrionDirect uses direct-RAM prime (~20 ms) rather than nominal ASIO c_target.
+            let bus_b_fill_ms = if bus_b.is_writer_active() {
+                (bus_b.get_physical_fill_ms() as f64).max(20.0)
+            } else {
+                20.0
+            };
+            Some(bus_a_fill_ms + bus_b_fill_ms)
+        } else {
+            None
+        };
+
+        // Read ORION's live internal delay (`Hop + WSOLA + GPU`) from Shared Memory when ORION is streaming:
+        let orion_internal_ms: f64 = if is_dsp_rsb || is_orion_direct || is_rsb_asio {
+            if let Some(pkt) = rinka_soundbridge_core::asio_host::read_orion_gpu_telemetry() {
+                if pkt.is_streaming != 0 && pkt.e2e_delay_ms.is_finite() && pkt.e2e_delay_ms > 20.0 {
+                    pkt.e2e_delay_ms as f64
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        // True Structural E2E Floor = Line A (HW + VST3) + ORION Internal + RSB Bridge Physical Fill (Bus A + Bus B) + Line B (HW + VST3)
+        let structural_floor_ms = self.est_a_ms.unwrap_or(0.0)
+            + orion_internal_ms
+            + bridge_cush_ms.unwrap_or(0.0)
+            + self.est_b_ms.unwrap_or(0.0);
+        (structural_floor_ms, orion_internal_ms, bridge_cush_ms)
+    }
+
+    fn compute_main_lat_with_badge(&self) -> (String, &'static str, Option<f64>) {
+        let (_structural_floor_ms, orion_internal_ms, bridge_cush_ms) = self.structural_floor_and_parts();
+        if let Some(ms) = self.lat_peak_ms.filter(|v| v.is_finite() && *v >= 0.0) {
+            // `estimate_latency_ms` mengukur software callback-to-callback; tambahkan `hw_dma_ms` dinamis
+            // dari quantum hardware aktual Line A + Line B (bukan lagi hardcoded 10.6 ms).
+            // Laporkan hasil pengukuran akustik secara jujur tanpa clamping buatan ke structural floor.
+            let hw_dma_ms = if self.hw_dma_ms.is_finite() && self.hw_dma_ms > 0.0 {
+                self.hw_dma_ms
+            } else {
+                10.67
+            };
+            let true_ms = ms + hw_dma_ms;
+            (format!("{:.1} ms", true_ms), "Measured", bridge_cush_ms)
+        } else if let (Some(a), Some(b)) = (self.est_a_ms, self.est_b_ms) {
+            let c = bridge_cush_ms.unwrap_or(0.0);
+            (format!("~{:.1} ms", a + orion_internal_ms + b + c), "Estimated", bridge_cush_ms)
+        } else if let Some(a) = self.est_a_ms {
+            (format!("~{:.1} ms", a), "Line A", bridge_cush_ms)
+        } else if let Some(b) = self.est_b_ms {
+            (format!("~{:.1} ms", b), "Line B", bridge_cush_ms)
+        } else {
+            ("-- ms".to_string(), "Idle", bridge_cush_ms)
+        }
+    }
+
+    fn compute_main_lat_str(&self) -> String {
+        self.compute_main_lat_with_badge().0
+    }
+}
+
+fn build_obs_overlay_html(initial_lat_str: &str) -> String {
+    format!(
+r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
+<title>RSB Delay ms</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: transparent;
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+    overflow: hidden;
+    padding: 12px;
+    -webkit-font-smoothing: antialiased;
+  }}
+  .rsb-pill {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: #272727;
+    border: 3px solid #383838;
+    border-radius: 24px;
+    padding: 14px 42px;
+  }}
+  .delay-ms {{
+    font-size: 56px;
+    font-weight: 700;
+    color: #60CDFF;
+    line-height: 1.15;
+    white-space: nowrap;
+  }}
+</style>
+</head>
+<body>
+  <div class="rsb-pill">
+    <span class="delay-ms" id="delay-ms">{initial_lat_str}</span>
+  </div>
+  <script>
+  (function() {{
+    var el = document.getElementById('delay-ms');
+    window.__rsb_on_delay = function(val) {{
+      if (val && el && el.textContent !== val) {{
+        el.textContent = val;
+      }}
+    }};
+    function pollScript(stamp) {{
+      var old = document.getElementById('rsb-live-js');
+      if (old && old.parentNode) old.parentNode.removeChild(old);
+      var s = document.createElement('script');
+      s.id = 'rsb-live-js';
+      s.src = 'obs_delay_live.js?t=' + stamp;
+      s.onload = s.onerror = function() {{
+        if (window.__rsb_delay) window.__rsb_on_delay(window.__rsb_delay);
+      }};
+      document.body.appendChild(s);
+    }}
+    function poll() {{
+      var stamp = Date.now();
+      if (window.fetch) {{
+        fetch('http://127.0.0.1:49812/delay.json?t=' + stamp, {{ cache: 'no-store', mode: 'cors' }})
+          .then(function(r) {{ return r.json(); }})
+          .then(function(d) {{ if (d && d.delay) window.__rsb_on_delay(d.delay); }})
+          .catch(function() {{ pollScript(stamp); }});
+      }} else {{
+        pollScript(stamp);
+      }}
+    }}
+    setInterval(poll, 350);
+    poll();
+  }})();
+  </script>
+</body>
+</html>
+"#
+    )
+}
+
+fn write_obs_live_js_atomic(dir: &Path, main_lat_str: &str) {
+    let js_body = format!(
+        "window.__rsb_delay = \"{}\"; if (window.__rsb_on_delay) window.__rsb_on_delay(\"{}\");\n",
+        main_lat_str, main_lat_str
+    );
+    let tmp_path = dir.join("obs_delay_live.tmp");
+    let final_path = dir.join("obs_delay_live.js");
+    if std::fs::write(&tmp_path, &js_body).is_ok() {
+        if std::fs::rename(&tmp_path, &final_path).is_err() {
+            let _ = std::fs::write(&final_path, &js_body);
+        }
+    } else {
+        let _ = std::fs::write(&final_path, &js_body);
+    }
+}
+
+fn ensure_obs_overlay_html_file(dir: &Path, initial_lat_str: &str, force_overwrite: bool) {
+    let html_path = dir.join("obs_delay_overlay.html");
+    let needs_write = if force_overwrite || !html_path.exists() {
+        true
+    } else if let Ok(existing) = std::fs::read_to_string(&html_path) {
+        existing.contains("http-equiv=\"refresh\"") || !existing.contains("127.0.0.1:49812")
+    } else {
+        true
+    };
+    if needs_write {
+        let html = build_obs_overlay_html(initial_lat_str);
+        let _ = std::fs::write(&html_path, html);
+    }
+}
+
+fn is_allowed_loopback_cors_origin(orig: &str) -> bool {
+    if !orig.is_ascii() || orig.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        return false;
+    }
+    let Some(host_port) = orig.strip_prefix("http://") else {
+        return false;
+    };
+    if host_port == "127.0.0.1" || host_port == "localhost" {
+        return true;
+    }
+    let port_str = if let Some(p) = host_port.strip_prefix("127.0.0.1:") {
+        p
+    } else if let Some(p) = host_port.strip_prefix("localhost:") {
+        p
+    } else {
+        return false;
+    };
+    !port_str.is_empty()
+        && port_str.bytes().all(|b| b.is_ascii_digit())
+        && matches!(port_str.parse::<u16>(), Ok(p) if p >= 1)
+}
+
+fn spawn_obs_delay_worker(
+    obs_shared: Arc<parking_lot::Mutex<ObsDelaySharedState>>,
+    running: Arc<std::sync::atomic::AtomicBool>,
+    shared_a: Arc<rinka_soundbridge_core::pipeline::SharedAudioState>,
+    shared_b: Arc<rinka_soundbridge_core::pipeline::SharedAudioState>,
+) {
+    std::thread::Builder::new()
+        .name("rinka-obs-delay-worker".to_string())
+        .spawn(move || {
+            enable_cpu_denormal_flush();
+            rinka_soundbridge_core::win32::ensure_1ms_timer_resolution();
+            rinka_soundbridge_core::win32::disable_windows_power_throttling();
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:49812").ok();
+            if let Some(ref l) = listener {
+                let _ = l.set_nonblocking(true);
+            }
+
+            let dir = get_savedata_dir();
+            let mut last_measure_tick = Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now);
+
+            while running.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = Instant::now();
+
+                // 1. Ukur korelasi suara In A -> Out B setiap 500 ms secara 24/7 di background thread
+                //    (tetap berjalan lancar meskipun jendela RSB di-minimize, masuk System Tray, atau tidak fokus!)
+                if now.saturating_duration_since(last_measure_tick) >= Duration::from_millis(500) {
+                    last_measure_tick = now;
+                    rinka_soundbridge_core::asio_host::inject_probe_into_running_external_vc_if_needed();
+
+                    let a_on = shared_a.is_enabled.load(std::sync::atomic::Ordering::Relaxed);
+                    let b_on = shared_b.is_enabled.load(std::sync::atomic::Ordering::Relaxed);
+                    let (streams_ok, dyn_ceiling_ms) = {
+                        let st_r = obs_shared.lock();
+                        let (sf, orion_internal_ms, _) = st_r.structural_floor_and_parts();
+                        let ceil = if orion_internal_ms > 20.0 && sf.is_finite() {
+                            (sf + 150.0).clamp(600.0, 1450.0)
+                        } else {
+                            // Saat telemetri ORION SHM tidak aktif (mis. external VC), jangan kunci ceiling
+                            // ke 555 ms agar delay nyata 600–1450 ms tidak terpotong oleh ceiling terlalu rendah.
+                            1450.0
+                        };
+                        (st_r.streams_running, ceil)
+                    };
+
+                    let measured_opt = if a_on && b_on && streams_ok {
+                        estimate_latency_ms_with_ceiling(
+                            &shared_a.probe_in,
+                            &shared_b.probe_out,
+                            1500.0,
+                            dyn_ceiling_ms,
+                        )
+                    } else {
+                        None
+                    };
+
+                    let mut st = obs_shared.lock();
+                    // Hanya reset hasil ukur jika hening/tidak ada pengukuran valid >= 10 detik
+                    // agar tampilan delay tidak berkedip ke ~Estimated saat user sedang berbicara terus-menerus!
+                    if measured_opt.is_none()
+                        && st.lat_peak_ms.is_some()
+                        && now.saturating_duration_since(st.lat_last_updated) >= Duration::from_secs(10)
+                    {
+                        st.lat_last_auto_reset = now;
+                        st.lat_peak_ms = None;
+                        st.lat_current_ms = None;
+                    }
+
+                    if a_on && b_on && streams_ok {
+                        if let Some(delay) = measured_opt {
+                            st.lat_current_ms = Some(delay);
+                            let new_peak = match st.lat_peak_ms {
+                                Some(p) if (delay - p).abs() > 180.0 => delay,
+                                Some(p) => p * 0.65 + delay * 0.35,
+                                None => delay,
+                            };
+                            st.lat_peak_ms = Some(new_peak);
+                            st.lat_last_updated = now;
+                        } else if now.saturating_duration_since(st.lat_last_updated) >= Duration::from_secs(8) {
+                            st.lat_current_ms = None;
+                        }
+                    } else {
+                        st.lat_current_ms = None;
+                        st.lat_peak_ms = None;
+                    }
+
+                    let main_lat_str = st.compute_main_lat_str();
+                    let changed = main_lat_str != st.current_display_str;
+                    let heartbeat_due =
+                        now.saturating_duration_since(st.last_js_write) >= Duration::from_secs(2);
+                    if changed || heartbeat_due {
+                        st.current_display_str = main_lat_str.clone();
+                        st.last_js_write = now;
+                        drop(st);
+                        write_obs_live_js_atomic(&dir, &main_lat_str);
+                        ensure_obs_overlay_html_file(&dir, &main_lat_str, false);
+                    }
+                }
+
+                // 2. Layani request HTTP lokal (http://127.0.0.1:49812/delay.json) untuk OBS Browser Source
+                if let Some(ref l) = listener {
+                    for _ in 0..8 {
+                        match l.accept() {
+                            Ok((mut stream, _)) => {
+                                let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+                                let _ = stream.set_write_timeout(Some(Duration::from_millis(50)));
+                                let mut req_buf = [0u8; 2048];
+                                let n = std::io::Read::read(&mut stream, &mut req_buf).unwrap_or(0);
+                                let req_raw = String::from_utf8_lossy(&req_buf[..n]);
+                                let header_block = req_raw.split("\r\n\r\n").next().unwrap_or(&req_raw);
+                                let first_line = header_block.lines().next().unwrap_or("");
+                                // Validasi ketat Origin CORS: hanya izinkan exact http://127.0.0.1[:port] atau http://localhost[:port].
+                                // Request same-origin/lokal tanpa header Origin tetap diizinkan; Origin: null atau domain asing ditolak.
+                                let origin_opt = header_block.lines().skip(1).find_map(|ln| {
+                                    let (k, v) = ln.split_once(':')?;
+                                    if k.trim().eq_ignore_ascii_case("origin") {
+                                        Some(v.trim())
+                                    } else {
+                                        None
+                                    }
+                                });
+                                let (cors_rejected, cors_hdr) = match origin_opt {
+                                    None => (false, String::new()),
+                                    Some(orig) if is_allowed_loopback_cors_origin(orig) => (
+                                        false,
+                                        format!("Access-Control-Allow-Origin: {}\r\nVary: Origin\r\n", orig),
+                                    ),
+                                    Some(_) => (true, "Vary: Origin\r\n".to_string()),
+                                };
+
+                                let resp = if cors_rejected {
+                                    "HTTP/1.1 403 Forbidden\r\nVary: Origin\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                                } else if first_line.starts_with("OPTIONS ") {
+                                    format!(
+                                        "HTTP/1.1 204 No Content\r\n{}Access-Control-Allow-Methods: GET, OPTIONS\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                                        cors_hdr
+                                    )
+                                } else if !first_line.starts_with("GET ") {
+                                    "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, OPTIONS\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                                } else {
+                                    let raw_str = obs_shared.lock().current_display_str.clone();
+                                    let cur_str: String = raw_str
+                                        .chars()
+                                        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '~'))
+                                        .collect();
+                                    let (content_type, body) = if first_line.starts_with("GET /delay.js") {
+                                        (
+                                            "application/javascript; charset=utf-8",
+                                            format!(
+                                                "window.__rsb_delay = \"{}\"; if (window.__rsb_on_delay) window.__rsb_on_delay(\"{}\");",
+                                                cur_str, cur_str
+                                            ),
+                                        )
+                                    } else if first_line.starts_with("GET / ")
+                                        || first_line.starts_with("GET /obs_delay_overlay")
+                                    {
+                                        (
+                                            "text/html; charset=utf-8",
+                                            build_obs_overlay_html(&cur_str),
+                                        )
+                                    } else {
+                                        (
+                                            "application/json; charset=utf-8",
+                                            format!("{{\"delay\":\"{}\"}}", cur_str),
+                                        )
+                                    };
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\nConnection: close\r\n\r\n{}",
+                                        content_type,
+                                        body.len(),
+                                        cors_hdr,
+                                        body
+                                    )
+                                };
+                                let _ = std::io::Write::write_all(&mut stream, resp.as_bytes());
+                            }
+                            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                std::thread::sleep(Duration::from_millis(45));
+            }
+        })
+        .ok();
+}
+
+struct RealShmAutoResetTransport {
+    obs_shared: Arc<parking_lot::Mutex<ObsDelaySharedState>>,
+}
+
+impl AutoResetTransport for RealShmAutoResetTransport {
+    fn check_and_clear_orion_reset_flags(&self) -> bool {
+        // Must NOT short-circuit `||`: clear bit 27 on BOTH bus_a and bus_b in one pass!
+        let a = get_dsp_rsb_bus_a_out().check_and_clear_coord_reset_flag();
+        let b = get_dsp_rsb_bus_b_in().check_and_clear_coord_reset_flag();
+        a || b
+    }
+
+    fn trigger_rsb_reset_flags(&self) {
+        get_dsp_rsb_bus_a_out().trigger_coord_reset_flag();
+        get_dsp_rsb_bus_b_in().trigger_coord_reset_flag();
+    }
+
+    fn reset_bus_a_if_vc_inactive(&self) {
+        let bus_a = get_dsp_rsb_bus_a_out();
+        if !bus_a.is_vc_active() {
+            bus_a.reset();
+        }
+    }
+
+    fn reset_bus_b_spike_and_resync(&self) {
+        get_dsp_rsb_bus_b_in().reset_spike_and_resync_cushion();
+    }
+
+    fn read_sync_pkt(&self) -> Option<rinka_soundbridge_core::asio_host::OrionAutoResetSyncPacket> {
+        rinka_soundbridge_core::asio_host::read_autoreset_sync_shm()
+    }
+
+    fn publish_config_shm(&self, enabled: bool, interval_mins: u32, cooldown_mins: u32) -> u32 {
+        rinka_soundbridge_core::asio_host::publish_rsb_autoreset_config_shm(
+            enabled,
+            interval_mins,
+            cooldown_mins,
+        )
+    }
+
+    fn publish_trigger_shm(&self, reset_count: u32) -> u32 {
+        rinka_soundbridge_core::asio_host::publish_rsb_autoreset_trigger_shm(reset_count)
+    }
+
+    fn sync_epoch_ms_shm(&self, epoch_ms: u64) {
+        rinka_soundbridge_core::asio_host::sync_rsb_autoreset_epoch_ms_shm(epoch_ms);
+    }
+
+    fn now_epoch_ms(&self) -> u64 {
+        rinka_soundbridge_core::asio_host::get_current_epoch_ms()
+    }
+
+    fn on_reset_completed(&self) {
+        rinka_soundbridge_core::asio_host::inject_probe_into_running_external_vc_if_needed();
+        {
+            let mut st = self.obs_shared.lock();
+            st.lat_peak_ms = None;
+            st.lat_current_ms = None;
+            st.lat_last_auto_reset = Instant::now();
+        }
+        trim_process_working_set();
+    }
+}
+
+struct RinkaSoundBridgeApp {
     wasapi_inputs: Vec<WasapiDeviceInfo>,
     wasapi_outputs: Vec<WasapiDeviceInfo>,
     asio_drivers: Vec<AsioDriverInfo>,
@@ -577,7 +1027,6 @@ pub struct RinkaSoundBridgeApp {
 
     last_watchdog_tick: Instant,
     last_perf_tick: Instant,
-    last_latency_tick: Instant,
     save_pending_since: Option<Instant>,
 
     perf_monitor: ProcessPerfMonitor,
@@ -587,9 +1036,9 @@ pub struct RinkaSoundBridgeApp {
 
     lat_current_ms: Option<f64>,
     lat_peak_ms: Option<f64>,
-    lat_last_updated: Instant,
-    lat_last_auto_reset: Instant,
     show_delay_bar: bool,
+    obs_shared: Arc<parking_lot::Mutex<ObsDelaySharedState>>,
+    obs_worker_running: Arc<std::sync::atomic::AtomicBool>,
 
     win_x: Option<i32>,
     win_y: Option<i32>,
@@ -603,6 +1052,18 @@ pub struct RinkaSoundBridgeApp {
     gpu_boost_lock_failsafe: bool,
     gpu_telemetry: GpuTelemetrySnapshot,
     asio_notes_text: String,
+    auto_reset_coord: Arc<AutoResetCoordinator>,
+    auto_reset_enabled: bool,
+    auto_reset_interval_mins: u32,
+    auto_reset_cooldown_mins: u32,
+    last_auto_reset_ts: Instant,
+    line_b_silent_since: Option<Instant>,
+    auto_reset_pending: bool,
+    auto_reset_flash_until: Option<Instant>,
+    auto_reset_count: u32,
+    last_auto_reset_reason: String,
+    smooth_peak_a: f32,
+    smooth_peak_b: f32,
 }
 
 impl RinkaSoundBridgeApp {
@@ -622,12 +1083,26 @@ impl RinkaSoundBridgeApp {
         let mut perf_monitor = ProcessPerfMonitor::new();
         let (cpu_pct, ram_mb) = perf_monitor.sample();
 
+        let pipeline_a = AudioPipeline::new("Line A");
+        let pipeline_b = AudioPipeline::new("Line B");
+        let obs_shared = Arc::new(parking_lot::Mutex::new(ObsDelaySharedState::new()));
+        let auto_reset_coord = AutoResetCoordinator::new(
+            Arc::clone(&pipeline_a.shared),
+            Arc::clone(&pipeline_b.shared),
+            Arc::new(RealShmAutoResetTransport {
+                obs_shared: Arc::clone(&obs_shared),
+            }),
+            true,
+            60,
+            10,
+        );
+
         let mut app = Self {
             wasapi_inputs,
             wasapi_outputs,
             asio_drivers,
-            pipeline_a: AudioPipeline::new("Line A"),
-            pipeline_b: AudioPipeline::new("Line B"),
+            pipeline_a,
+            pipeline_b,
             vol_a: 100,
             vol_b: 100,
             ov_in_labels_a: vec!["(no file loaded)".to_string()],
@@ -652,11 +1127,22 @@ impl RinkaSoundBridgeApp {
             gpu_boost_lock_ui_open: false,
             gpu_boost_lock_mhz: 1980,
             gpu_boost_lock_failsafe: true,
-            gpu_telemetry: poll_gpu_clock_telemetry_with_failsafe(true),
+            gpu_telemetry: GpuTelemetrySnapshot::default(),
             asio_notes_text: load_or_create_asio_notes_txt(),
+            auto_reset_coord,
+            auto_reset_enabled: true,
+            auto_reset_interval_mins: 60,
+            auto_reset_cooldown_mins: 10,
+            last_auto_reset_ts: Instant::now(),
+            line_b_silent_since: None,
+            auto_reset_pending: false,
+            auto_reset_flash_until: None,
+            auto_reset_count: 0,
+            last_auto_reset_reason: "Standby".to_string(),
+            smooth_peak_a: 0.0,
+            smooth_peak_b: 0.0,
             last_watchdog_tick: Instant::now(),
             last_perf_tick: Instant::now(),
-            last_latency_tick: Instant::now(),
             save_pending_since: None,
             perf_monitor,
             tray_manager: SystemTrayManager::new_with_icon(&APP_ICON_RGBA),
@@ -664,9 +1150,9 @@ impl RinkaSoundBridgeApp {
             ram_mb,
             lat_current_ms: None,
             lat_peak_ms: None,
-            lat_last_updated: Instant::now(),
-            lat_last_auto_reset: Instant::now(),
             show_delay_bar: true,
+            obs_shared,
+            obs_worker_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             win_x: None,
             win_y: None,
             win_w: Some(1020),
@@ -676,6 +1162,15 @@ impl RinkaSoundBridgeApp {
         };
 
         app.load_config_on_startup();
+        app.auto_reset_coord
+            .start_watchdog(Duration::from_millis(150));
+        app.sync_obs_delay_files(true);
+        spawn_obs_delay_worker(
+            Arc::clone(&app.obs_shared),
+            Arc::clone(&app.obs_worker_running),
+            Arc::clone(&app.pipeline_a.shared),
+            Arc::clone(&app.pipeline_b.shared),
+        );
         app.asio_drivers = get_asio_devices();
         if boost_process_priority() {
             log_info("Process priority raised to Above Normal & EcoQoS Throttling disabled");
@@ -745,16 +1240,43 @@ impl RinkaSoundBridgeApp {
     /// Sinkronkan ke-3 ASIO (Line A, Line B, dan "Rinka SoundBridge ASIO" khusus Output Line A & Input Line B)
     /// agar selalu mengikuti 1 setting terpadu (smp, Sample Rate, Set In, Set Out, dan perangkat yang dipilih).
     /// Menjaga `BUS_DSP_B_IN` di Shared Memory selalu terkunci 100% pada `self.dsp_rsb_config` milik user
-    /// di setiap frame sehingga tidak pernah bisa kembali ke 90ms/100ms saat Vonovox di-stop/start!
+    /// di setiap frame sehingga tidak pernah bisa kembali ke 90ms/100ms saat External VC di-stop/start!
     fn enforce_live_dsp_b_cushion(&self) {
         if self.pipeline_a.driver_backend == DriverBackend::RsbAsio {
+            let sr = self.pipeline_a.sample_rate.max(44100) as f64;
+            let in_v = if self.rsb_asio_config.set_in_latency_enabled {
+                self.rsb_asio_config.in_latency_val.clamp(0.0, 1000.0)
+            } else {
+                0.0
+            };
+            let out_v = if self.rsb_asio_config.set_out_latency_enabled {
+                self.rsb_asio_config.out_latency_val.clamp(0.0, 1000.0)
+            } else {
+                0.0
+            };
+            let eff_cush_ms = (50.0 + out_v + in_v * 0.5).clamp(50.0, 450.0);
+            let base_cush = (((eff_cush_ms as f64) / 1000.0) * sr).round().clamp(1440.0, 24000.0) as u32;
+            self.pipeline_a.shared.rsb_asio_out_cush_smp.store(base_cush, std::sync::atomic::Ordering::Relaxed);
+            self.pipeline_b.shared.rsb_asio_out_cush_smp.store(base_cush, std::sync::atomic::Ordering::Relaxed);
+            let smp = self.rsb_asio_config.effective_buffer_size(self.pipeline_a.buffer_size);
+            get_dsp_rsb_bus_b_in().enforce_rsb_dsp_b_config(
+                self.pipeline_a.sample_rate.max(44100),
+                smp,
+                base_cush,
+                true,
+                true,
+                1.15,
+                3,
+                25.0,
+                15.0,
+            );
             return;
         }
         let dsp_sr = self.pipeline_a.sample_rate.max(44100);
         let dsp_smp = self
             .dsp_rsb_config
             .effective_buffer_size(self.pipeline_a.buffer_size);
-        let eff_cush_ms = self.dsp_rsb_config.dsp_b_cushion_ms.clamp(20.0, 450.0);
+        let eff_cush_ms = self.dsp_rsb_config.dsp_b_cushion_ms.clamp(0.0, 450.0);
         let dsp_cush_smp = (((eff_cush_ms as f64) / 1000.0) * (dsp_sr as f64)).round() as u32;
         get_dsp_rsb_bus_b_in().enforce_rsb_dsp_b_config(
             dsp_sr,
@@ -765,6 +1287,7 @@ impl RinkaSoundBridgeApp {
             self.dsp_rsb_config.gpu_stall_multiplier,
             self.dsp_rsb_config.adaptive_mode as u8,
             self.dsp_rsb_config.adaptive_extra_ms,
+            self.dsp_rsb_config.stall_guard_ms,
         );
     }
 
@@ -849,6 +1372,17 @@ impl RinkaSoundBridgeApp {
         cfg.global.gpu_boost_lock_enabled = self.gpu_boost_lock_enabled;
         cfg.global.gpu_boost_lock_mhz = self.gpu_telemetry.max_graphics_mhz.clamp(900, 3300);
         cfg.global.gpu_boost_lock_failsafe = self.gpu_boost_lock_failsafe;
+        self.auto_reset_interval_mins = self.auto_reset_interval_mins.clamp(1, 240);
+        self.auto_reset_cooldown_mins = self.auto_reset_cooldown_mins.clamp(1, 240);
+        self.dsp_rsb_config.auto_reset_enabled = self.auto_reset_enabled;
+        self.dsp_rsb_config.auto_reset_interval_mins = self.auto_reset_interval_mins;
+        self.dsp_rsb_config.auto_reset_cooldown_mins = self.auto_reset_cooldown_mins;
+        self.rsb_asio_config.auto_reset_enabled = self.auto_reset_enabled;
+        self.rsb_asio_config.auto_reset_interval_mins = self.auto_reset_interval_mins;
+        self.rsb_asio_config.auto_reset_cooldown_mins = self.auto_reset_cooldown_mins;
+        cfg.global.auto_reset_enabled = self.auto_reset_enabled;
+        cfg.global.auto_reset_interval_mins = self.auto_reset_interval_mins;
+        cfg.global.auto_reset_cooldown_mins = self.auto_reset_cooldown_mins;
 
         cfg.line_a = Self::serialize_line(&self.pipeline_a, self.vol_a);
         cfg.line_b = Self::serialize_line(&self.pipeline_b, self.vol_b);
@@ -890,15 +1424,13 @@ impl RinkaSoundBridgeApp {
         }
 
         self.sync_triple_asio = cfg.global.sync_triple_asio;
-        self.gpu_boost_lock_enabled = cfg.global.gpu_boost_lock_enabled;
-        self.gpu_boost_lock_mhz = cfg.global.gpu_boost_lock_mhz.clamp(900, 3300);
+        // CRITICAL FIX FOR ORION GPU DELAY:
+        // Never auto-enable GPU clock lock on startup (which previously locked Laptop GPUs to Base Clock ~1200 MHz
+        // and polled NVML every 1s over PCIe, slowing ORION FP32/TF32/BF16/FP16 by up to 100%)!
+        self.gpu_boost_lock_enabled = false;
+        self.gpu_boost_lock_mhz = cfg.global.gpu_boost_lock_mhz.clamp(1650, 3300);
         self.gpu_boost_lock_failsafe = cfg.global.gpu_boost_lock_failsafe;
-        if self.gpu_boost_lock_enabled {
-            if set_gpu_boost_clock_lock_with_failsafe(true, self.gpu_boost_lock_failsafe).is_err() {
-                self.gpu_boost_lock_enabled = false;
-            }
-            self.gpu_telemetry = poll_gpu_clock_telemetry_with_failsafe(self.gpu_boost_lock_failsafe);
-        }
+        unlock_gpu_clocks_quiet_on_startup();
 
         Self::restore_line_state(
             &mut self.pipeline_a,
@@ -981,12 +1513,26 @@ impl RinkaSoundBridgeApp {
         }
 
         self.dsp_rsb_config = cfg.asio_dsp_rsb.clone();
+        self.auto_reset_enabled = self.dsp_rsb_config.auto_reset_enabled;
+        self.auto_reset_interval_mins = self.dsp_rsb_config.auto_reset_interval_mins.clamp(1, 240);
+        self.auto_reset_cooldown_mins = self.dsp_rsb_config.auto_reset_cooldown_mins.clamp(1, 240);
+        self.dsp_rsb_config.auto_reset_interval_mins = self.auto_reset_interval_mins;
+        self.dsp_rsb_config.auto_reset_cooldown_mins = self.auto_reset_cooldown_mins;
+        self.auto_reset_coord.update_config_from_ui(
+            self.auto_reset_enabled,
+            self.auto_reset_interval_mins,
+            self.auto_reset_cooldown_mins,
+            true,
+        );
+        self.sync_auto_reset_ui_snapshot();
         self.dsp_rsb_config.dsp_b_cushion_ms =
-            self.dsp_rsb_config.dsp_b_cushion_ms.clamp(20.0, 450.0);
+            self.dsp_rsb_config.dsp_b_cushion_ms.clamp(0.0, 450.0);
         self.dsp_rsb_config.adaptive_extra_ms =
             self.dsp_rsb_config.adaptive_extra_ms.clamp(0.0, 250.0);
         self.dsp_rsb_config.gpu_stall_multiplier =
             self.dsp_rsb_config.gpu_stall_multiplier.clamp(1.00, 1.30);
+        self.dsp_rsb_config.stall_guard_ms =
+            self.dsp_rsb_config.stall_guard_ms.clamp(0.0, 150.0);
         self.dsp_rsb_config.sync_sample_rate_with_rsb = true;
         self.dsp_rsb_config.buffer_size = self
             .dsp_rsb_config
@@ -1014,7 +1560,7 @@ impl RinkaSoundBridgeApp {
 
         let _ = self.sync_unified_asio_config(true);
         get_dsp_rsb_bus_b_in().reset_spike_and_resync_cushion();
-        rinka_soundbridge_core::asio_host::inject_probe_into_running_vonovox_if_needed();
+        rinka_soundbridge_core::asio_host::inject_probe_into_running_external_vc_if_needed();
         self.pipeline_a.restart_stream();
         self.pipeline_b.restart_stream();
     }
@@ -1114,11 +1660,12 @@ impl RinkaSoundBridgeApp {
         self.asio_drivers = get_asio_devices();
 
         get_dsp_rsb_bus_b_in().reset_spike_and_resync_cushion();
-        rinka_soundbridge_core::asio_host::inject_probe_into_running_vonovox_if_needed();
+        rinka_soundbridge_core::asio_host::inject_probe_into_running_external_vc_if_needed();
         self.pipeline_a.restart_stream();
         self.pipeline_b.restart_stream();
-        self.lat_peak_ms = None;
-        self.lat_current_ms = None;
+        self.reset_measured_delay();
+        self.auto_reset_coord.clear_pending_flag();
+        self.auto_reset_pending = false;
 
         log_info(format!(
             "Audio devices refreshed: {} WASAPI In, {} WASAPI Out, {} ASIO Drivers.",
@@ -1133,6 +1680,9 @@ impl RinkaSoundBridgeApp {
             return;
         }
         self.is_shut_down = true;
+        self.auto_reset_coord.stop_watchdog();
+        self.obs_worker_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         // Auto-Reset & Auto-Off GPU Boost Lock saat Rinka SoundBridge ditutup / dimatikan
         if self.gpu_boost_lock_enabled || self.gpu_telemetry.is_boost_locked {
             self.gpu_boost_lock_enabled = false;
@@ -1158,6 +1708,7 @@ impl RinkaSoundBridgeApp {
         }
         release_single_instance();
         shutdown_logger();
+        mark_clean_shutdown_complete();
     }
 
     fn reload_application(&mut self, ctx: &egui::Context) {
@@ -1171,7 +1722,7 @@ impl RinkaSoundBridgeApp {
 
     fn periodic_background_tasks(&mut self, _ctx: &egui::Context) {
         self.enforce_live_dsp_b_cushion();
-        rinka_soundbridge_core::asio_host::inject_probe_into_running_vonovox_if_needed();
+        rinka_soundbridge_core::asio_host::inject_probe_into_running_external_vc_if_needed();
         let (restored_from_tray, quit_from_tray) = self.tray_manager.poll_events();
         if quit_from_tray || is_tray_quit_requested() {
             self.clean_shutdown();
@@ -1213,12 +1764,16 @@ impl RinkaSoundBridgeApp {
             let (cpu, ram) = self.perf_monitor.sample();
             self.cpu_pct = cpu;
             self.ram_mb = ram;
-            self.gpu_telemetry = poll_gpu_clock_telemetry_with_failsafe(self.gpu_boost_lock_failsafe);
-            if self.gpu_boost_lock_enabled && !self.gpu_telemetry.is_boost_locked {
-                self.gpu_boost_lock_enabled = false;
-                self.trigger_auto_save();
-                if let Some(alert) = take_gpu_failsafe_alert() {
-                    show_info_message_box("GPU Boost Lock — Failsafe Auto-Canceled", &alert);
+            // Hanya panggil NVML jika GPU Boost Lock aktif atau panelnya sedang dibuka,
+            // sehingga tidak pernah mengganggu PCIe / CUDA FP32 milik ORION!
+            if self.gpu_boost_lock_enabled || self.gpu_boost_lock_ui_open {
+                self.gpu_telemetry = poll_gpu_clock_telemetry_with_failsafe(self.gpu_boost_lock_failsafe);
+                if self.gpu_boost_lock_enabled && !self.gpu_telemetry.is_boost_locked {
+                    self.gpu_boost_lock_enabled = false;
+                    self.trigger_auto_save();
+                    if let Some(alert) = take_gpu_failsafe_alert() {
+                        show_info_message_box("GPU Boost Lock — Failsafe Auto-Canceled", &alert);
+                    }
                 }
             }
 
@@ -1245,39 +1800,116 @@ impl RinkaSoundBridgeApp {
             asio_diag_poll();
         }
 
-        if now.saturating_duration_since(self.last_latency_tick) >= Duration::from_millis(1000) {
-            self.last_latency_tick = now;
-            // Auto-reset angka ms delay In A -> Out B setiap 10 detik agar selalu menampilkan pembacaan segar!
-            if now.saturating_duration_since(self.lat_last_auto_reset) >= Duration::from_secs(10) {
-                self.lat_last_auto_reset = now;
-                self.lat_peak_ms = None;
-                self.lat_current_ms = None;
+        // =====================================================================
+        // AUTO-RESET PERIODIC WATCHDOG (TRAY-SAFE DEDICATED BACKGROUND THREAD)
+        // =====================================================================
+        // Single-owner architecture: `AutoResetCoordinator` runs on its own 150ms
+        // background thread (`rinka-autoreset-watchdog`) so coordinated resets
+        // (ORION->RSB bit 27 / `trigger_seq` and RSB->ORION bit 31 / `trigger_seq`)
+        // work seamlessly even while hidden in System Tray (`SW_HIDE`, 0 UI frames).
+        // `App::update()` NEVER double-fires resets; it only mirrors snapshots &
+        // persists any remote config updates or deferred faulted-stream restarts.
+        if let Some((new_en, new_iv, new_cd)) = self.auto_reset_coord.take_peer_config_if_dirty() {
+            self.auto_reset_enabled = new_en;
+            self.auto_reset_interval_mins = new_iv;
+            self.auto_reset_cooldown_mins = new_cd;
+            self.dsp_rsb_config.auto_reset_enabled = new_en;
+            self.dsp_rsb_config.auto_reset_interval_mins = new_iv;
+            self.dsp_rsb_config.auto_reset_cooldown_mins = new_cd;
+            self.rsb_asio_config.auto_reset_enabled = new_en;
+            self.rsb_asio_config.auto_reset_interval_mins = new_iv;
+            self.rsb_asio_config.auto_reset_cooldown_mins = new_cd;
+            self.trigger_auto_save();
+        }
+        let (need_restart_a, need_restart_b) = self.auto_reset_coord.take_pending_restarts();
+        if need_restart_a && self.pipeline_a.is_enabled() {
+            self.pipeline_a.restart_stream();
+        }
+        if need_restart_b && self.pipeline_b.is_enabled() {
+            self.pipeline_b.restart_stream();
+        }
+        self.sync_auto_reset_ui_snapshot();
+
+        self.sync_obs_delay_files(false);
+    }
+
+    fn sync_auto_reset_ui_snapshot(&mut self) {
+        let snap = self.auto_reset_coord.snapshot();
+        self.auto_reset_enabled = snap.enabled;
+        self.auto_reset_interval_mins = snap.interval_mins;
+        self.auto_reset_cooldown_mins = snap.cooldown_mins;
+        self.last_auto_reset_ts = snap.last_reset_ts;
+        self.line_b_silent_since = snap.line_b_silent_since;
+        self.auto_reset_pending = snap.pending;
+        self.auto_reset_flash_until = snap.flash_until;
+        self.auto_reset_count = snap.reset_count;
+        self.last_auto_reset_reason = snap.last_reason;
+    }
+
+    /// Eksekusi Fast Micro-Reset (< 15 ms, tanpa sleep 120ms, tanpa enumerasi ulang daftar device COM,
+    /// dan tanpa menutup/membongkar DLL VST3 atau proses aplikasi) agar 100% bebas gangguan saat live stream.
+    fn execute_fast_periodic_reset(&mut self, reason: &str) {
+        self.auto_reset_coord.trigger_manual_reset(reason);
+        let (need_restart_a, need_restart_b) = self.auto_reset_coord.take_pending_restarts();
+        if need_restart_a && self.pipeline_a.is_enabled() {
+            self.pipeline_a.restart_stream();
+        }
+        if need_restart_b && self.pipeline_b.is_enabled() {
+            self.pipeline_b.restart_stream();
+        }
+        self.sync_auto_reset_ui_snapshot();
+        self.sync_obs_delay_files(false);
+    }
+
+    fn reset_measured_delay(&mut self) {
+        self.lat_peak_ms = None;
+        self.lat_current_ms = None;
+        {
+            let mut st = self.obs_shared.lock();
+            st.lat_peak_ms = None;
+            st.lat_current_ms = None;
+            st.lat_last_auto_reset = Instant::now();
+        }
+        self.sync_obs_delay_files(false);
+    }
+
+    fn sync_obs_delay_files(&mut self, force_html_overwrite: bool) {
+        let est_a = self.pipeline_a.estimated_line_latency_ms();
+        let est_b = self.pipeline_b.estimated_line_latency_ms();
+        let streams_ok = self.pipeline_a.is_enabled()
+            && self.pipeline_a.streams_running()
+            && self.pipeline_b.is_enabled()
+            && self.pipeline_b.streams_running();
+
+        let (peak_ms, curr_ms, main_lat_str, changed) = {
+            let mut st = self.obs_shared.lock();
+            st.est_a_ms = est_a;
+            st.est_b_ms = est_b;
+            st.hw_dma_ms = self.pipeline_a.estimated_hw_quantum_ms()
+                + self.pipeline_b.estimated_hw_quantum_ms();
+            st.driver_backend = self.pipeline_a.driver_backend;
+            st.sample_rate_b = self.pipeline_b.effective_sample_rate().max(44100);
+            st.streams_running = streams_ok;
+            if !streams_ok {
+                st.lat_peak_ms = None;
+                st.lat_current_ms = None;
             }
-            if self.pipeline_a.is_enabled()
-                && self.pipeline_a.streams_running()
-                && self.pipeline_b.is_enabled()
-                && self.pipeline_b.streams_running()
-            {
-                if let Some(delay) = estimate_latency_ms(
-                    &self.pipeline_a.shared.probe_in,
-                    &self.pipeline_b.shared.probe_out,
-                    1500.0,
-                ) {
-                    self.lat_current_ms = Some(delay);
-                    let new_peak = match self.lat_peak_ms {
-                        Some(p) if (delay - p).abs() > 180.0 => delay,
-                        Some(p) => p * 0.65 + delay * 0.35,
-                        None => delay,
-                    };
-                    self.lat_peak_ms = Some(new_peak);
-                    self.lat_last_updated = now;
-                } else if now.saturating_duration_since(self.lat_last_updated) >= Duration::from_secs(8) {
-                    self.lat_current_ms = None;
-                }
-            } else {
-                self.lat_current_ms = None;
-                self.lat_peak_ms = None;
+            let s = st.compute_main_lat_str();
+            let ch = s != st.current_display_str;
+            if ch {
+                st.current_display_str = s.clone();
+                st.last_js_write = Instant::now();
             }
+            (st.lat_peak_ms, st.lat_current_ms, s, ch)
+        };
+
+        self.lat_peak_ms = peak_ms;
+        self.lat_current_ms = curr_ms;
+
+        if changed || force_html_overwrite {
+            let dir = get_savedata_dir();
+            write_obs_live_js_atomic(&dir, &main_lat_str);
+            ensure_obs_overlay_html_file(&dir, &main_lat_str, force_html_overwrite);
         }
     }
 
@@ -1292,75 +1924,143 @@ impl RinkaSoundBridgeApp {
             .rounding(Rounding::same(12.0))
             .inner_margin(Margin::symmetric(12.0, 10.0))
             .show(ui, |ui| {
-                // BARIS 1: Pill CPU/RAM di Kiri | Buffer Size & Sample Rate di Kanan
+                let hdr_w = ui.available_width();
+                let is_compact_hdr = hdr_w < 960.0;
+                // BARIS 1: Pill CPU/RAM di Kiri | Buffer Size & Sample Rate di Kanan (Responsive Half-Screen!)
                 ui.horizontal(|ui| {
                     egui::Frame::none()
                         .fill(Palette::BG_PANEL)
                         .stroke(Stroke::new(1.0_f32, Palette::BORDER))
                         .rounding(Rounding::same(8.0))
-                        .inner_margin(Margin::symmetric(10.0, 5.0))
+                        .inner_margin(Margin::symmetric(if is_compact_hdr { 7.0 } else { 10.0 }, 5.0))
                         .show(ui, |ui| {
                             let (icon_rect, _) =
-                                ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
+                                ui.allocate_exact_size(Vec2::new(15.0, 15.0), Sense::hover());
                             paint_monitor_icon(&ui.painter(), icon_rect.center());
-                            ui.add_space(4.0);
+                            ui.add_space(3.0);
                             ui.label(
-                                RichText::new(format!(
-                                    "CPU: {:.1}%  |  RAM: {} MB  |",
-                                    self.cpu_pct, self.ram_mb
-                                ))
-                                .font(FontId::new(12.5, FontFamily::Proportional))
+                                RichText::new(if is_compact_hdr {
+                                    format!("CPU:{:.1}% | RAM:{}M |", self.cpu_pct, self.ram_mb)
+                                } else {
+                                    format!("CPU: {:.1}%  |  RAM: {} MB  |", self.cpu_pct, self.ram_mb)
+                                })
+                                .font(FontId::new(if is_compact_hdr { 11.2 } else { 12.2 }, FontFamily::Proportional))
                                 .strong()
                                 .color(Palette::ACCENT_GREEN_DEEP),
                             );
                             let (b_rect, b_resp) =
-                                ui.allocate_exact_size(Vec2::new(12.0, 15.0), Sense::hover());
+                                ui.allocate_exact_size(Vec2::new(11.0, 14.0), Sense::hover());
                             paint_bolt_icon(&ui.painter(), b_rect.center(), Palette::ACCENT_GREEN);
                             b_resp.on_hover_text(
                                 "FTZ/DAZ Hardware Denormal Flush + Windows 11 EcoQoS Power Throttling Guard Active",
                             );
                             ui.label(
-                                RichText::new("FTZ/DAZ + EcoQoS Guard Active")
-                                    .font(FontId::new(12.0, FontFamily::Proportional))
-                                    .strong()
-                                    .color(Palette::ACCENT_GREEN_DEEP),
+                                RichText::new(if is_compact_hdr {
+                                    "FTZ+EcoQoS"
+                                } else {
+                                    "FTZ/DAZ + EcoQoS Guard"
+                                })
+                                .font(FontId::new(if is_compact_hdr { 11.0 } else { 11.8 }, FontFamily::Proportional))
+                                .strong()
+                                .color(Palette::ACCENT_GREEN_DEEP),
                             )
                             .on_hover_text(
                                 "FTZ/DAZ prevents CPU spikes during silence in VST3 plugins, and EcoQoS Guard prevents Windows 11 from throttling performance when minimized.",
                             );
+
+                            let now_hdr = Instant::now();
+                            let is_flashing = self
+                                .auto_reset_flash_until
+                                .map(|t| now_hdr < t)
+                                .unwrap_or(false);
+                            let blink_on = ((now_hdr
+                                .saturating_duration_since(self.last_auto_reset_ts)
+                                .as_millis()
+                                / 250)
+                                % 2)
+                                == 0;
+                            let interval_s = (self.auto_reset_interval_mins.clamp(1, 240) as u64) * 60;
+                            let up_s = now_hdr
+                                .saturating_duration_since(self.last_auto_reset_ts)
+                                .as_secs();
+                            let rem_s = interval_s.saturating_sub(up_s);
+                            let hard_rem_s = (interval_s + 60).saturating_sub(up_s);
+                            let (ar_txt, ar_col) = if is_flashing {
+                                (
+                                    format!("🔴 RESETTING (#{})", self.auto_reset_count),
+                                    if blink_on { Palette::ACCENT_CORAL } else { Palette::ACCENT_YELLOW },
+                                )
+                            } else if !self.auto_reset_enabled {
+                                ("| 🔄 Auto-Reset: OFF".to_string(), Palette::TEXT_MUTED)
+                            } else if self.auto_reset_pending {
+                                (
+                                    format!("| 🔴 Reset Pending (Wait 1.2s / Force {}s)", hard_rem_s),
+                                    if blink_on { Palette::ACCENT_CORAL } else { Palette::ACCENT_YELLOW },
+                                )
+                            } else {
+                                (
+                                    format!("| 🔄 {:02}:{:02}", rem_s / 60, rem_s % 60),
+                                    Palette::ACCENT_BLUE,
+                                )
+                            };
+                            ui.label(
+                                RichText::new(ar_txt)
+                                    .font(FontId::new(11.8, FontFamily::Proportional))
+                                    .strong()
+                                    .color(ar_col),
+                            )
+                            .on_hover_text(format!(
+                                "Periodic Fast Auto-Reset Watchdog (v2.3 — 2-Way Directional SHM Sync w/ ORION):
+                                 • Status: {} (Interval: {} min)
+                                 • Directional SHM Reset: RSB→ORION (bit 31) & ORION→RSB (bit 27) — zero collision, zero echo loop.
+                                 • Smart Silence Trigger: Waits until Line B Output == 0 (silent) for >= 1.2s after {} min.
+                                 • 60-Second Hard Limit: If no 1.2s silent gap occurs within +60s, forces an instant <15ms micro-reset.
+                                 • Completed Resets: #{} (Last: {})",
+                                if self.auto_reset_enabled { "ON" } else { "OFF" },
+                                self.auto_reset_interval_mins,
+                                self.auto_reset_interval_mins,
+                                self.auto_reset_count,
+                                self.last_auto_reset_reason
+                            ));
                         });
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let mut sr = self.pipeline_a.sample_rate;
                         egui::ComboBox::from_id_source("cb_sr")
                             .selected_text(format!("{} Hz", sr))
-                            .width(105.0)
+                            .width(if is_compact_hdr { 90.0 } else { 102.0 })
                             .show_ui(ui, |ui| {
                                 for cand in [44100u32, 48000u32, 96000u32] {
                                     ui.selectable_value(&mut sr, cand, format!("{} Hz", cand));
                                 }
                             });
 
-                        egui::Frame::none()
-                            .fill(Palette::BG_PANEL)
-                            .stroke(Stroke::new(1.0_f32, Palette::BORDER))
-                            .rounding(Rounding::same(6.0))
-                            .inner_margin(Margin::symmetric(8.0, 4.0))
-                            .show(ui, |ui| {
-                                ui.label(
-                                    RichText::new("Sample Rate:")
-                                        .size(12.0)
-                                        .color(Palette::TEXT_SECONDARY),
-                                );
-                            });
+                        if !is_compact_hdr {
+                            egui::Frame::none()
+                                .fill(Palette::BG_PANEL)
+                                .stroke(Stroke::new(1.0_f32, Palette::BORDER))
+                                .rounding(Rounding::same(6.0))
+                                .inner_margin(Margin::symmetric(6.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new("SR:")
+                                            .size(11.5)
+                                            .color(Palette::TEXT_SECONDARY),
+                                    );
+                                });
+                        }
 
-                        ui.add_space(8.0);
+                        ui.add_space(if is_compact_hdr { 4.0 } else { 6.0 });
 
                         let mut buf = self.pipeline_a.buffer_size;
                         let cur_ms = (buf as f64 / (sr.max(44100) as f64)) * 1000.0;
                         egui::ComboBox::from_id_source("cb_buf")
-                            .selected_text(format!("{} Samples ({:.1} ms)", buf, cur_ms))
-                            .width(175.0)
+                            .selected_text(if is_compact_hdr {
+                                format!("{} smp ({:.1}ms)", buf, cur_ms)
+                            } else {
+                                format!("{} Samples ({:.1} ms)", buf, cur_ms)
+                            })
+                            .width(if is_compact_hdr { 132.0 } else { 165.0 })
                             .show_ui(ui, |ui| {
                                 for cand in [32u32, 64, 128, 256, 512, 1024, 2048] {
                                     let ms = (cand as f64 / (sr.max(44100) as f64)) * 1000.0;
@@ -1376,11 +2076,11 @@ impl RinkaSoundBridgeApp {
                             .fill(Palette::BG_PANEL)
                             .stroke(Stroke::new(1.0_f32, Palette::BORDER))
                             .rounding(Rounding::same(6.0))
-                            .inner_margin(Margin::symmetric(8.0, 4.0))
+                            .inner_margin(Margin::symmetric(if is_compact_hdr { 5.0 } else { 8.0 }, 4.0))
                             .show(ui, |ui| {
                                 ui.label(
-                                    RichText::new("Buffer Size:")
-                                        .size(12.0)
+                                    RichText::new(if is_compact_hdr { "Buf:" } else { "Buffer Size:" })
+                                        .size(if is_compact_hdr { 11.2 } else { 12.0 })
                                         .color(Palette::TEXT_SECONDARY),
                                 );
                             });
@@ -1440,20 +2140,22 @@ impl RinkaSoundBridgeApp {
                                 DriverBackend::AsioDspRsb | DriverBackend::AsioExperimental => {
                                     "Driver: ⚡ SoundBridge ASIO (Experimental)"
                                 }
+                                DriverBackend::OrionDirect => "Driver: 🚀 ORION",
                             };
                             egui::ComboBox::from_id_source("cb_global_driver")
                                 .selected_text(
                                     RichText::new(drv_text)
-                                        .size(12.5)
+                                        .size(if is_compact_hdr { 11.5 } else { 12.5 })
                                         .strong()
                                         .color(match cur_drv {
+                                            DriverBackend::OrionDirect => Palette::ACCENT_BLUE,
                                             DriverBackend::RsbAsio => Palette::ACCENT_PINK,
                                             DriverBackend::AsioDspRsb
                                             | DriverBackend::AsioExperimental => Palette::ACCENT_GREEN,
                                             _ => Palette::TEXT_PRIMARY,
                                         }),
                                 )
-                                .width(250.0)
+                                .width(if is_compact_hdr { 188.0 } else { 245.0 })
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut cur_drv,
@@ -1461,8 +2163,9 @@ impl RinkaSoundBridgeApp {
                                         "🔊 WASAPI Shared",
                                     )
                                     .on_hover_text(
-                                        "WASAPI Shared (Default):
-                                         Uses 10ms COM Event-Driven Bit-Exact Direct Audio + Tight Lock-Free FIFO.",
+                                        "WASAPI Shared (Default — v2.3):
+                                         • 10ms COM Event-Driven Bit-Exact Direct Audio + Cache-Line-Aligned Lock-Free SPSC AudioFIFO.
+                                         • Zero mutexes & zero allocations on RT callbacks with Phase-Continuous Catmull-Rom drift lock.",
                                     );
                                     ui.selectable_value(
                                         &mut cur_drv,
@@ -1475,9 +2178,19 @@ impl RinkaSoundBridgeApp {
                                         "🎛️ Rsb ASIO (Experimental)",
                                     )
                                     .on_hover_text(
-                                        "Rsb ASIO (Experimental — Built-in FlexASIO without Virtual Cable):
-                                         • Flow: WASAPI In A (Mic A) -> VST A -> ASIO Out A -> Vonovox ('ASIO: RSB ASIO') -> Loopback In B -> VST B -> WASAPI Out B (Speaker B).
-                                         • 100% Bit-Exact 1:1 audio quality with Hardware-Clock-Slaved SPSC & Mode 4 Adaptive Cushion.",
+                                        "Rsb ASIO (Built-in FlexASIO without Virtual Cable — v2.3):
+                                         • Flow: WASAPI In A (Mic A) -> VST A -> ASIO Out A -> VC ('ASIO: RSB ASIO') -> Loopback In B -> VST B -> WASAPI Out B (Speaker B).
+                                         • 100% Bit-Exact 1:1 audio with strict SPSC SHM bridge, True-Silence Excess Trim & anti-stuck-delay recovery.",
+                                    );
+                                    ui.selectable_value(
+                                        &mut cur_drv,
+                                        DriverBackend::OrionDirect,
+                                        "🚀 ORION (Direct Shared-Memory RAM Pipe)",
+                                    )
+                                    .on_hover_text(
+                                        "Driver: ORION (Zero-Copy Direct Shared-Memory RAM Pipe):
+                                         • Connects Rinka SoundBridge v2.3 directly in RAM to ORION (set ORION Driver to 'Rinka SoundBridge').
+                                         • Only select Line A Input (Mic) and Line B Output (Speaker); Line A Out & Line B In flow via atomic SPSC RAM Pipe with Mode 6 Spike-Damped Adaptive Cushion & automatic anti-stuck-delay recovery!",
                                     );
                                     ui.selectable_value(
                                         &mut cur_drv,
@@ -1485,8 +2198,8 @@ impl RinkaSoundBridgeApp {
                                         "⚡ SoundBridge ASIO (Experimental)",
                                     )
                                     .on_hover_text(
-                                        "SoundBridge ASIO (Experimental — Adaptive GPU Cushion Modes 1-5):
-                                         • Uses 'ASIO: Rinka SoundBridge ASIO' in Vonovox with Dynamic GPU Delay Sensors (Modes 1-5, Default Mode 4) + Extra Buffer.",
+                                        "SoundBridge ASIO (Adaptive GPU Cushion Modes 1–6 — v2.3):
+                                         • Uses 'ASIO: Rinka SoundBridge ASIO' with Dynamic GPU Delay Sensors (Modes 1–6), Formula: max(Base Cushion, Sensor × Multiplier + Stall Guard), True-Silence Cushion Builder, Formant PLC & anti-stuck-delay recovery.",
                                     );
                                 });
 
@@ -1509,14 +2222,20 @@ impl RinkaSoundBridgeApp {
                         .inner_margin(Margin::symmetric(6.0, 5.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
-                                let avail_for_tray = (ui.available_width() - 326.0).max(160.0);
+                                let ref_w = if is_compact_hdr { 148.0 } else { 188.0 };
+                                let rel_w = if is_compact_hdr { 104.0 } else { 116.0 };
+                                let avail_for_tray = (ui.available_width() - (ref_w + rel_w + 16.0)).max(120.0);
 
                                 // 1. Tombol SYSTEM TRAY (#60CDFF biru cerah seperti v1.22)
                                 let btn_tray = egui::Button::new(
-                                    RichText::new("📥 SYSTEM TRAY (RUN IN BACKGROUND)")
-                                        .font(FontId::new(12.0, FontFamily::Proportional))
-                                        .strong()
-                                        .color(Color32::WHITE),
+                                    RichText::new(if is_compact_hdr {
+                                        "📥 SYSTEM TRAY (BG)"
+                                    } else {
+                                        "📥 SYSTEM TRAY (RUN IN BACKGROUND)"
+                                    })
+                                    .font(FontId::new(if is_compact_hdr { 11.0 } else { 12.0 }, FontFamily::Proportional))
+                                    .strong()
+                                    .color(Color32::WHITE),
                                 )
                                 .fill(Palette::ACCENT_BLUE)
                                 .rounding(Rounding::same(8.0));
@@ -1534,14 +2253,18 @@ impl RinkaSoundBridgeApp {
 
                                 // 2. Tombol REFRESH AUDIO DEVICE (#6CCB5F hijau cerah seperti v1.22)
                                 let btn_ref = egui::Button::new(
-                                    RichText::new("🎧 REFRESH AUDIO DEVICE")
-                                        .font(FontId::new(12.0, FontFamily::Proportional))
-                                        .strong()
-                                        .color(Color32::WHITE),
+                                    RichText::new(if is_compact_hdr {
+                                        "🎧 REFRESH AUDIO"
+                                    } else {
+                                        "🎧 REFRESH AUDIO DEVICE"
+                                    })
+                                    .font(FontId::new(if is_compact_hdr { 11.0 } else { 12.0 }, FontFamily::Proportional))
+                                    .strong()
+                                    .color(Color32::WHITE),
                                 )
                                 .fill(Palette::ACCENT_GREEN)
                                 .rounding(Rounding::same(8.0));
-                                if ui.add_sized([192.0, 28.0], btn_ref).clicked() {
+                                if ui.add_sized([ref_w, 28.0], btn_ref).clicked() {
                                     self.refresh_audio_devices();
                                 }
 
@@ -1550,13 +2273,13 @@ impl RinkaSoundBridgeApp {
                                 // 3. Tombol RESTART APP (#FCE100 kuning cerah seperti v1.22)
                                 let btn_rel = egui::Button::new(
                                     RichText::new("⚡ RESTART APP")
-                                        .font(FontId::new(12.0, FontFamily::Proportional))
+                                        .font(FontId::new(if is_compact_hdr { 11.0 } else { 12.0 }, FontFamily::Proportional))
                                         .strong()
                                         .color(Color32::WHITE),
                                 )
                                 .fill(Palette::ACCENT_YELLOW)
                                 .rounding(Rounding::same(8.0));
-                                if ui.add_sized([118.0, 28.0], btn_rel).clicked() {
+                                if ui.add_sized([rel_w, 28.0], btn_rel).clicked() {
                                     self.reload_application(ctx);
                                 }
                             });
@@ -1589,12 +2312,13 @@ impl RinkaSoundBridgeApp {
         let asio_drivers = self.asio_drivers.clone();
         let vc_prof_snap = self.asio_vc_profile.clone();
 
-        let (pipeline, vol, ov_in_labels, ov_out_labels) = if is_line_a {
+        let (pipeline, vol, ov_in_labels, ov_out_labels, sm_ref) = if is_line_a {
             (
                 &mut self.pipeline_a,
                 &mut self.vol_a,
                 &mut self.ov_in_labels_a,
                 &mut self.ov_out_labels_a,
+                &mut self.smooth_peak_a,
             )
         } else {
             (
@@ -1602,6 +2326,7 @@ impl RinkaSoundBridgeApp {
                 &mut self.vol_b,
                 &mut self.ov_in_labels_b,
                 &mut self.ov_out_labels_b,
+                &mut self.smooth_peak_b,
             )
         };
 
@@ -1708,8 +2433,7 @@ impl RinkaSoundBridgeApp {
 
                     let clean_status = pipeline
                         .status_message
-                        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '(')
-                        .replace("->", "->");
+                        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '(');
                     let xrun_tip = format!(
                         "Xrun (underflow/overflow): In {} | Out {}",
                         pipeline.in_xruns(),
@@ -2052,14 +2776,14 @@ impl RinkaSoundBridgeApp {
                                 .show(ui, |ui| {
                                     ui.set_min_width((full_w - 16.0).max(80.0));
                                     ui.label(
-                                        RichText::new("🔒 Internal Loopback: VST Out A ➔ ASIO Out A (To Vonovox Input)")
+                                        RichText::new("🔒 Internal Loopback: VST Out A ➔ ASIO Out A (To External VC Input)")
                                             .size(11.5)
                                             .strong()
                                             .color(Palette::ACCENT_PINK),
                                     );
                                     ui.label(
                                         RichText::new(format!(
-                                            "WASAPI In A -> VST A -> Select ASIO in Vonovox: \"{}\"",
+                                            "WASAPI In A -> VST A -> Select ASIO in External VC: \"{}\"",
                                             RSB_ASIO_DRIVER_NAME
                                         ))
                                         .size(11.0)
@@ -2088,7 +2812,7 @@ impl RinkaSoundBridgeApp {
                                     );
                                     ui.label(
                                         RichText::new(format!(
-                                            "From Vonovox (\"{}\") -> WASAPI Loopback B -> VST B",
+                                            "From External VC (\"{}\") -> WASAPI Loopback B -> VST B",
                                             RSB_ASIO_DRIVER_NAME
                                         ))
                                         .size(11.0)
@@ -2155,12 +2879,12 @@ impl RinkaSoundBridgeApp {
                             "Auto smp".to_string()
                         };
                         let lat_in_str = if rcfg.set_in_latency_enabled {
-                            format!("In:{:.1}s", rcfg.in_latency_val)
+                            format!("In:{:.0}ms", rcfg.in_latency_val)
                         } else {
                             "In:Auto".to_string()
                         };
                         let lat_out_str = if rcfg.set_out_latency_enabled {
-                            format!("Out:{:.1}s", rcfg.out_latency_val)
+                            format!("Out:{:.0}ms", rcfg.out_latency_val)
                         } else {
                             "Out:Auto".to_string()
                         };
@@ -2180,15 +2904,15 @@ impl RinkaSoundBridgeApp {
                             .add_sized([full_w, 30.0], btn_open_rsb_asio)
                             .on_hover_text(
                                 "Open RSB ASIO (Built-in FlexASIO GUI):
-                                 • Driver Name in Vonovox: 'ASIO: RSB ASIO' (Never conflicts with external FlexASIO)
+                                 • Driver Name in External VC / DAW: 'ASIO: RSB ASIO' (Never conflicts with external FlexASIO)
                                  • Pure FlexASIO GUI v0.35 layout + Auto-Sync Buffer Size with RSB
-                                 • Input/Output Device, Set Input/Output Latency (0.0s), WASAPI Exclusive/AutoConvert, Channels & TOML Output Preview",
+                                 • Input/Output Device, Set Input/Output Latency (0–1000 ms), WASAPI Exclusive/AutoConvert, Channels & TOML Output Preview",
                             )
                             .clicked()
                         {
                             open_rsb_asio_setting_modal = true;
                         }
-                    } else if pipeline.driver_backend == DriverBackend::AsioDspRsb {
+                    } else if pipeline.driver_backend == DriverBackend::AsioDspRsb || pipeline.driver_backend == DriverBackend::OrionDirect {
                         // MODE SoundBridge ASIO (PURE INTERNAL DSP):
                         // - Line A: Hanya pilih Input (Mic / SSL Input 1) -> VST -> otomatis ke DSP A Out ("DSP RSB Exp ASIO").
                         // - Line B: Otomatis dari DSP B In ("DSP RSB Exp ASIO") -> VST -> hanya pilih Output (Speaker / Otogai).
@@ -2252,17 +2976,23 @@ impl RinkaSoundBridgeApp {
                                 .inner_margin(Margin::symmetric(8.0, 5.0))
                                 .show(ui, |ui| {
                                     ui.set_min_width((full_w - 16.0).max(80.0));
+                                    let is_orion_drv = pipeline.driver_backend == DriverBackend::OrionDirect;
                                     ui.label(
-                                        RichText::new("🔒 Automatic: Line A ASIO Out -> ASIO Bridge (To Vonovox Input)")
-                                            .size(11.5)
-                                            .strong()
-                                            .color(Palette::ACCENT_GREEN),
+                                        RichText::new(if is_orion_drv {
+                                            "🔒 Automatic: Line A Out -> Direct Shared-Memory RAM Pipe (To ORION)"
+                                        } else {
+                                            "🔒 Automatic: Line A ASIO Out -> ASIO Bridge (To External VC Input)"
+                                        })
+                                        .size(11.5)
+                                        .strong()
+                                        .color(if is_orion_drv { Palette::ACCENT_BLUE } else { Palette::ACCENT_GREEN }),
                                     );
                                     ui.label(
-                                        RichText::new(format!(
-                                            "A In [ASIO] -> Line A VST -> ASIO: \"{}\"",
-                                            DSP_RSB_ASIO_DRIVER_NAME
-                                        ))
+                                        RichText::new(if is_orion_drv {
+                                            "A In -> Line A VST -> Shared RAM Pipe (BUS_DSP_A_OUT -> ORION)".to_string()
+                                        } else {
+                                            format!("A In [ASIO] -> Line A VST -> ASIO: \"{}\"", DSP_RSB_ASIO_DRIVER_NAME)
+                                        })
                                         .size(11.0)
                                         .color(Palette::TEXT_SECONDARY),
                                     );
@@ -2281,17 +3011,23 @@ impl RinkaSoundBridgeApp {
                                 .inner_margin(Margin::symmetric(8.0, 5.0))
                                 .show(ui, |ui| {
                                     ui.set_min_width((full_w - 16.0).max(80.0));
+                                    let is_orion_drv = pipeline.driver_backend == DriverBackend::OrionDirect;
                                     ui.label(
-                                        RichText::new("🔒 Automatic: ASIO Bridge (From Vonovox Output) -> Line B ASIO In")
-                                            .size(11.5)
-                                            .strong()
-                                            .color(Palette::ACCENT_GREEN),
+                                        RichText::new(if is_orion_drv {
+                                            "🔒 Automatic: Direct Shared-Memory RAM Pipe (ORION + Cushion) -> Line B In"
+                                        } else {
+                                            "🔒 Automatic: ASIO Bridge (From External VC Output) -> Line B ASIO In"
+                                        })
+                                        .size(11.5)
+                                        .strong()
+                                        .color(if is_orion_drv { Palette::ACCENT_BLUE } else { Palette::ACCENT_GREEN }),
                                     );
                                     ui.label(
-                                        RichText::new(format!(
-                                            "ASIO: \"{}\" -> Line B VST -> B Out [ASIO]",
-                                            DSP_RSB_ASIO_DRIVER_NAME
-                                        ))
+                                        RichText::new(if is_orion_drv {
+                                            "Shared RAM Pipe (BUS_DSP_B_IN + Mode 6 Cushion) -> Line B VST -> B Out".to_string()
+                                        } else {
+                                            format!("ASIO: \"{}\" -> Line B VST -> B Out [ASIO]", DSP_RSB_ASIO_DRIVER_NAME)
+                                        })
                                         .size(11.0)
                                         .color(Palette::TEXT_SECONDARY),
                                     );
@@ -2358,24 +3094,16 @@ impl RinkaSoundBridgeApp {
                             format!("CPU: {}C", dsp_cfg.asio_cpu_cores)
                         };
                         let live_vono_ms = get_dsp_rsb_bus_b_in().get_measured_gpu_stall_ms();
-                        let extra_ms = dsp_cfg.adaptive_extra_ms.clamp(0.0, 250.0);
-                        let eff_vono_ms = if live_vono_ms >= 1.0 { live_vono_ms + extra_ms } else { 0.0 };
+                        let mult_val = dsp_cfg.gpu_stall_multiplier.clamp(1.00, 1.30);
+                        let guard_ms = dsp_cfg.stall_guard_ms.clamp(0.0, 150.0);
                         let (act_cush_smp, _) = get_dsp_rsb_bus_b_in().get_dsp_b_params();
                         let act_cush_ms = (act_cush_smp as f32 / (pipeline.effective_sample_rate().max(44100) as f32)) * 1000.0;
                         let mode_badge = if live_vono_ms >= 1.0 {
-                            if extra_ms >= 0.5 {
-                                format!("GPU: {:.0}+{:.0}={:.0}ms | Cushion: {:.0}ms", live_vono_ms, extra_ms, eff_vono_ms, act_cush_ms)
-                            } else {
-                                format!("Vonovox GPU: {:.0}ms | Cushion: {:.0}ms", live_vono_ms, act_cush_ms)
-                            }
+                            format!("GPU: {:.0}ms (×{:.2}+{:.0}ms) | Cushion: {:.0}ms", live_vono_ms, mult_val, guard_ms, act_cush_ms)
                         } else if dsp_cfg.adaptive_cushion {
-                            if extra_ms >= 0.5 {
-                                format!("Adaptive +{:.0}ms | Cushion: {:.0}ms", extra_ms, act_cush_ms)
-                            } else {
-                                format!("Adaptive Cushion {:.0}ms", act_cush_ms)
-                            }
+                            format!("Adaptive (×{:.2}+{:.0}ms) | Cushion: {:.0}ms", mult_val, guard_ms, act_cush_ms)
                         } else {
-                            format!("Cushion {:.0}ms (+{:.0}ms)", dsp_cfg.dsp_b_cushion_ms, extra_ms)
+                            format!("Manual Cushion {:.0}ms", dsp_cfg.dsp_b_cushion_ms)
                         };
                         let btn_open_dsp_setting = egui::Button::new(
                             RichText::new(format!(
@@ -2536,15 +3264,17 @@ impl RinkaSoundBridgeApp {
                                                     if ui
                                                         .add_sized([avail_title_w, 28.0], title_btn)
                                                         .on_hover_text({
-                                                            let lat_smp = slot.latency_samples.load(std::sync::atomic::Ordering::Relaxed);
                                                             let sr = pipeline.effective_sample_rate().max(44100) as f64;
-                                                            let raw_lat_ms = (lat_smp as f64 / sr) * 1000.0;
-                                                            let eff_lat_ms = raw_lat_ms.min(40.0);
+                                                            let (eff_smp, raw_smp) = rinka_soundbridge_core::pipeline::effective_vst_slot_latency_samples(slot, sr);
+                                                            let raw_lat_ms = (raw_smp as f64 / sr) * 1000.0;
+                                                            let eff_lat_ms = (eff_smp as f64 / sr) * 1000.0;
                                                             let us = slot.last_process_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0;
-                                                            let lat_note = if raw_lat_ms > 45.0 {
-                                                                format!("~{:.1} ms real-time vocal (static DAW PDC: {:.0} ms / {} smp)", eff_lat_ms, raw_lat_ms, lat_smp)
+                                                            let lat_note = if raw_smp > 0 {
+                                                                format!("{:.1} ms true unclamped VST3 PDC ({} samples)", raw_lat_ms, raw_smp)
+                                                            } else if eff_smp > 0 {
+                                                                format!("~{:.1} ms estimated acoustic/DSP delay (DAW PDC: 0 smp)", eff_lat_ms)
                                                             } else {
-                                                                format!("{:.1} ms ({} samples)", raw_lat_ms, lat_smp)
+                                                                "0.0 ms (zero-latency)".to_string()
                                                             };
                                                             format!(
                                                                 "Click to open GUI editor: {}
@@ -2702,8 +3432,8 @@ DSP Load: {:.1} us/block | VST Lookahead Delay: {}",
                                 .rounding(Rounding::same(6.0)),
                             )
                             .on_hover_text(
-                                "Pre-VST 20Hz DC Blocker (Zero-Latency):
-Removes microphone capsule DC offset & sub-sonic rumble (<20Hz) before entering the VST3 chain for cleaner pitch detection and voice conversion.",
+                                "Pre-VST 5Hz 64-bit DC Blocker (Zero-Latency):
+Removes microphone capsule DC offset (0 Hz) in double-precision f64 with zero bass/warmth phase shift (60–200 Hz) before entering the VST3 chain.",
                             )
                             .clicked()
                         {
@@ -3017,10 +3747,19 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                     });
 
                     ui.add_space(4.0);
+                    let raw_pk = pipeline.peak_level().clamp(0.0, 1.5);
+                    if raw_pk >= *sm_ref {
+                        *sm_ref = 0.58 * raw_pk + 0.42 * (*sm_ref);
+                    } else {
+                        *sm_ref *= 0.85;
+                        if *sm_ref < 0.0015 {
+                            *sm_ref = 0.0;
+                        }
+                    }
                     draw_diagonal_meter(
                         ui,
                         Vec2::new(full_w, 18.0),
-                        pipeline.peak_level(),
+                        *sm_ref,
                         6.5,
                         2.5,
                         4.5,
@@ -3487,7 +4226,217 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
     /// 2) Kotak Catatan / Notes (`Savedata\asio_performance_notes.txt`) di bagian paling bawah setiap jendela ASIO Settings.
     fn draw_gpu_boost_lock_and_notes_section(&mut self, ui: &mut egui::Ui, id_salt: &str) {
         let mut trigger_save = false;
+        let mut trigger_manual_reset_now = false;
         let auto_boost_cap_mhz = self.gpu_telemetry.max_graphics_mhz.max(1350);
+
+        // =====================================================================
+        // BAGIAN 0: PERIODIC AUTO-RESET WATCHDOG (LINE B OUT = 0 + 60s HARD LIMIT)
+        // =====================================================================
+        let now_ar = Instant::now();
+        let is_flashing_ar = self
+            .auto_reset_flash_until
+            .map(|t| now_ar < t)
+            .unwrap_or(false);
+        let ar_border = if is_flashing_ar || self.auto_reset_pending {
+            Palette::ACCENT_CORAL
+        } else if self.auto_reset_enabled {
+            Palette::ACCENT_GREEN
+        } else {
+            Palette::BORDER_STRONG
+        };
+
+        egui::Frame::none()
+            .fill(Palette::BG_PANEL_ALT)
+            .stroke(Stroke::new(1.1_f32, ar_border))
+            .rounding(Rounding::same(10.0))
+            .inner_margin(Margin::symmetric(10.0, 6.0))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let chk_col = if self.auto_reset_enabled {
+                        Palette::ACCENT_GREEN
+                    } else {
+                        Palette::TEXT_SECONDARY
+                    };
+                    let mut ar_cfg_changed = false;
+                    let mut ar_reset_timer = false;
+                    if ui
+                        .checkbox(
+                            &mut self.auto_reset_enabled,
+                            RichText::new("🔄 Auto-Reset (Sync ORION):")
+                                .size(11.2)
+                                .strong()
+                                .color(chk_col),
+                        )
+                        .on_hover_text(
+                            "2-Way Synchronized Auto-Reset & Cooldown Watchdog (RSB v2.3 ↔ ORION):
+                             • Runs on a dedicated tray-safe background thread (works even while hidden in System Tray!).
+                             • Directional SHM Bit Contract (bit 31 RSB→ORION, bit 27 ORION→RSB) + double-read SHM sync (zero collision, zero torn reads).
+                             • Changing ON/OFF, Cooldown (min), or Target (min) here automatically updates ORION in real time (and vice versa).
+                             • Cooldown 1.2s (default 10 min): The 1.2-second silent detector ONLY activates AFTER this cooldown has elapsed!
+                             • Target Timer (default 60 min): Periodic full refresh target (+60s hard limit fallback).",
+                        )
+                        .changed()
+                    {
+                        self.dsp_rsb_config.auto_reset_enabled = self.auto_reset_enabled;
+                        self.rsb_asio_config.auto_reset_enabled = self.auto_reset_enabled;
+                        ar_cfg_changed = true;
+                        ar_reset_timer = true;
+                        trigger_save = true;
+                    }
+
+                    ui.add_enabled_ui(self.auto_reset_enabled, |ui| {
+                        ui.label(
+                            RichText::new("CD 1.2s:")
+                                .size(10.5)
+                                .strong()
+                                .color(Palette::TEXT_SECONDARY),
+                        );
+                        if ui
+                            .add_sized(
+                                [56.0, 21.0],
+                                egui::DragValue::new(&mut self.auto_reset_cooldown_mins)
+                                    .speed(1.0)
+                                    .clamp_range(1..=240)
+                                    .suffix("m"),
+                            )
+                            .on_hover_text(
+                                "Cooldown before the 1.2-second silent detector becomes active (1 to 240 min, default 10 min). Synced with ORION.",
+                            )
+                            .changed()
+                        {
+                            self.auto_reset_cooldown_mins = self.auto_reset_cooldown_mins.clamp(1, 240);
+                            self.dsp_rsb_config.auto_reset_cooldown_mins = self.auto_reset_cooldown_mins;
+                            self.rsb_asio_config.auto_reset_cooldown_mins = self.auto_reset_cooldown_mins;
+                            ar_cfg_changed = true;
+                            trigger_save = true;
+                        }
+
+                        ui.label(
+                            RichText::new("Target:")
+                                .size(10.5)
+                                .strong()
+                                .color(Palette::TEXT_SECONDARY),
+                        );
+                        if ui
+                            .add_sized(
+                                [56.0, 21.0],
+                                egui::DragValue::new(&mut self.auto_reset_interval_mins)
+                                    .speed(1.0)
+                                    .clamp_range(1..=240)
+                                    .suffix("m"),
+                            )
+                            .on_hover_text(
+                                "Periodic Target Reset Interval (1 to 240 minutes, default 60 min). Synced with ORION.",
+                            )
+                            .changed()
+                        {
+                            self.auto_reset_interval_mins = self.auto_reset_interval_mins.clamp(1, 240);
+                            self.dsp_rsb_config.auto_reset_interval_mins = self.auto_reset_interval_mins;
+                            self.rsb_asio_config.auto_reset_interval_mins = self.auto_reset_interval_mins;
+                            ar_cfg_changed = true;
+                            trigger_save = true;
+                        }
+
+                        for (p_min, p_lbl) in [
+                            (10u32, "CD 10m"),
+                            (15, "CD 15m"),
+                            (30, "CD 30m"),
+                        ] {
+                            let is_sel = self.auto_reset_cooldown_mins == p_min;
+                            if Self::draw_tactile_pill(
+                                ui,
+                                p_lbl,
+                                is_sel,
+                                Palette::ACCENT_GREEN,
+                                46.0,
+                            )
+                            .clicked()
+                            {
+                                self.auto_reset_cooldown_mins = p_min;
+                                self.dsp_rsb_config.auto_reset_cooldown_mins = p_min;
+                                self.rsb_asio_config.auto_reset_cooldown_mins = p_min;
+                                ar_cfg_changed = true;
+                                trigger_save = true;
+                            }
+                        }
+                    });
+                    if ar_cfg_changed {
+                        self.auto_reset_coord.update_config_from_ui(
+                            self.auto_reset_enabled,
+                            self.auto_reset_interval_mins,
+                            self.auto_reset_cooldown_mins,
+                            ar_reset_timer,
+                        );
+                        self.sync_auto_reset_ui_snapshot();
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let btn_rst_now = egui::Button::new(
+                            RichText::new("⚡ Reset Now")
+                                .size(10.8)
+                                .strong()
+                                .color(Color32::WHITE),
+                        )
+                        .fill(Palette::ACCENT_BLUE_DEEP)
+                        .stroke(Stroke::new(1.0_f32, Palette::ACCENT_BLUE))
+                        .rounding(Rounding::same(5.0));
+                        if ui
+                            .add_sized([86.0, 21.0], btn_rst_now)
+                            .on_hover_text("Execute an immediate fast (<15ms) non-disruptive stream & cushion micro-reset now.")
+                            .clicked()
+                        {
+                            trigger_manual_reset_now = true;
+                        }
+
+                        let interval_s = (self.auto_reset_interval_mins.clamp(1, 240) as u64) * 60;
+                        let up_s = now_ar
+                            .saturating_duration_since(self.last_auto_reset_ts)
+                            .as_secs();
+                        let rem_s = interval_s.saturating_sub(up_s);
+                        let hard_rem_s = (interval_s + 60).saturating_sub(up_s);
+                        let sil_s = self
+                            .line_b_silent_since
+                            .map(|t| now_ar.saturating_duration_since(t).as_secs_f32())
+                            .unwrap_or(0.0);
+
+                        let status_str = if is_flashing_ar {
+                            format!("🔴 RESET #{} DONE!", self.auto_reset_count)
+                        } else if !self.auto_reset_enabled {
+                            "⚪ Disabled".to_string()
+                        } else if self.auto_reset_pending {
+                            format!(
+                                "⏳ Wait Line B=0 ({:.1}s/1.2s) | Force: {}s",
+                                sil_s.min(1.2),
+                                hard_rem_s
+                            )
+                        } else {
+                            format!(
+                                "⏱ {:02}:{:02} | Line B=0: {:.1}s/1.2s (+60s Hard)",
+                                rem_s / 60,
+                                rem_s % 60,
+                                sil_s.min(9.9)
+                            )
+                        };
+
+                        ui.label(
+                            RichText::new(status_str)
+                                .font(FontId::new(10.8, FontFamily::Monospace))
+                                .strong()
+                                .color(if is_flashing_ar || self.auto_reset_pending {
+                                    Palette::ACCENT_CORAL
+                                } else {
+                                    Palette::ACCENT_BLUE
+                                }),
+                        );
+                    });
+                });
+            });
+
+        if trigger_manual_reset_now {
+            self.execute_fast_periodic_reset("Manual Fast Reset Button");
+        }
+
+        ui.add_space(6.0);
 
         // =====================================================================
         // BAGIAN A: SAFE GPU BOOST CLOCK LOCK (DISEMBUNYIKAN SECARA DEFAULT)
@@ -3772,7 +4721,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
 
                         if ui
                             .small_button("↺ Reset Default Tip")
-                            .on_hover_text("Restore default English recommendation about GPU Clock Boost locking")
+                            .on_hover_text("Restore default performance recommendation notes for GPU Clock Boost locking")
                             .clicked()
                         {
                             self.asio_notes_text = DEFAULT_ASIO_NOTES_TEXT.to_string();
@@ -3939,7 +4888,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                             ui,
                             "asio_vc",
                             "3. Dedicated VC ASIO — Driver: \"Rinka SoundBridge ASIO\"",
-                            "Select dedicated In & Out for Voice Changer / Vonovox (e.g. In = Loopback 1 L/R -> Out = Output 3/4)",
+                            "Select dedicated In & Out for AI Voice Changer / External VC (e.g. In = Loopback 1 L/R -> Out = Output 3/4)",
                             Palette::ACCENT_LAVENDER,
                             &mut prof_vc,
                             &in_items,
@@ -4147,7 +5096,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                 let eff_sr = rsb_global_sr.max(44100) as f64;
                 let rsb_ms = (rsb_global_buf as f64 / eff_sr) * 1000.0;
 
-                let live_cush_smp = (((cfg.dsp_b_cushion_ms.clamp(20.0, 450.0) as f64) / 1000.0) * eff_sr).round() as u32;
+                let live_cush_smp = (((cfg.dsp_b_cushion_ms.clamp(0.0, 450.0) as f64) / 1000.0) * eff_sr).round() as u32;
                 get_dsp_rsb_bus_b_in().enforce_rsb_dsp_b_config(
                     rsb_global_sr.max(44100),
                     cfg.effective_buffer_size(rsb_global_buf),
@@ -4157,14 +5106,16 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                     cfg.gpu_stall_multiplier,
                     cfg.adaptive_mode as u8,
                     cfg.adaptive_extra_ms,
+                    cfg.stall_guard_ms,
                 );
 
                 let live_raw_ms = get_dsp_rsb_bus_b_in().get_measured_gpu_stall_ms();
-                let extra_ms = cfg.adaptive_extra_ms.clamp(0.0, 250.0);
-                let eff_assumed_ms = if live_raw_ms >= 1.0 {
-                    live_raw_ms + extra_ms
+                let mult_val = cfg.gpu_stall_multiplier.clamp(1.00, 1.30);
+                let guard_ms = cfg.stall_guard_ms.clamp(0.0, 150.0);
+                let computed_req_ms = if live_raw_ms >= 1.0 {
+                    live_raw_ms * mult_val + guard_ms
                 } else {
-                    cfg.dsp_b_cushion_ms + extra_ms
+                    cfg.dsp_b_cushion_ms
                 };
                 let (active_cush_smp, _) = get_dsp_rsb_bus_b_in().get_dsp_b_params();
                 let active_cush_ms = (active_cush_smp as f64 / eff_sr) * 1000.0;
@@ -4235,22 +5186,37 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                         AdaptiveCushionMode::PredictivePreemptivePlc => {
                                             let (py_ms, sw_ms, _) = get_dsp_rsb_bus_b_in().get_hybrid_dual_sensor_ms();
                                             if py_ms > 0.5 && sw_ms > 0.5 {
-                                                format!("Beta2 [Py:{:.0}+SW:{:.0}] {:.0}ms", py_ms, sw_ms, live_raw_ms)
+                                                format!("Pred [Py:{:.0}+SW:{:.0}] {:.0}ms", py_ms, sw_ms, live_raw_ms)
                                             } else {
-                                                format!("Beta2 Pred {:.0}ms", live_raw_ms)
+                                                format!("Pred {:.0}ms", live_raw_ms)
+                                            }
+                                        }
+                                        AdaptiveCushionMode::OrionHybridFusion => {
+                                            let (orion_ms, sw_ms, _) = get_dsp_rsb_bus_b_in().get_hybrid_dual_sensor_ms();
+                                            if let Some(pkt) = read_orion_gpu_telemetry_shm_only() {
+                                                format!(
+                                                    "ORION IPC [GPU:{:.1}|EMA:{:.1}|SW:{:.0}] {:.0}ms",
+                                                    pkt.gpu_delay_ms, pkt.ema_gpu_delay_ms, sw_ms, live_raw_ms
+                                                )
+                                            } else if orion_ms > 0.5 && sw_ms > 0.5 {
+                                                format!("ORION [OR:{:.1}+SW:{:.0}] {:.0}ms", orion_ms, sw_ms, live_raw_ms)
+                                            } else if orion_ms > 0.5 {
+                                                format!("ORION [OR:{:.1}ms] {:.0}ms", orion_ms, live_raw_ms)
+                                            } else {
+                                                format!("ORION+SW {:.0}ms", live_raw_ms)
                                             }
                                         }
                                     };
 
                                     let formula_str = if is_active {
                                         format!(
-                                            "{} + {:.0}ms = {:.0}ms ➔ Cushion: {:.0}ms (Fill: {:.0}ms)",
-                                            sensor_str, extra_ms, eff_assumed_ms, active_cush_ms, phys_fill_ms
+                                            "{} × {:.2} + {:.0}ms Guard = {:.0}ms ➔ Cushion: {:.0}ms (Fill: {:.0}ms)",
+                                            sensor_str, mult_val, guard_ms, computed_req_ms, active_cush_ms, phys_fill_ms
                                         )
                                     } else {
                                         format!(
-                                            "Standby | Base {:.0}ms + Extra {:.0}ms ➔ Ready Cushion: {:.0}ms",
-                                            cfg.dsp_b_cushion_ms, extra_ms, active_cush_ms
+                                            "Standby | Base {:.0}ms | Guard +{:.0}ms (×{:.2}) ➔ Ready Cushion: {:.0}ms",
+                                            cfg.dsp_b_cushion_ms, guard_ms, mult_val, active_cush_ms
                                         )
                                     };
 
@@ -4264,11 +5230,31 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                                 Palette::TEXT_PRIMARY
                                             }),
                                     )
-                                    .on_hover_text(
-                                        "Live Adaptive Formula:\n\
-                                         Effective Assumed Delay = Sensor Delay + Extra Buffer (e.g., 50ms + 25ms = 75ms).\n\
-                                         Active Cushion automatically adjusts above that value.",
-                                    );
+                                    .on_hover_text(if let Some(pkt) = read_orion_gpu_telemetry_shm_only() {
+                                        format!(
+                                            "ORION Live IPC Telemetry (RSB v2.3 — Local\\ORION_GPU_TELEMETRY_V1):\n\
+                                             • GPU Block Delay: {:.1} ms (EMA: {:.1} ms | Min: {:.1} ms | Max: {:.1} ms)\n\
+                                             • Stages: HuBERT {:.1}ms | RMVPE {:.1}ms | Synth {:.1}ms | WSOLA+DSP {:.1}ms\n\
+                                             • ORION Target Cushion: {:.1} ms | ORION Internal E2E: {:.0} ms | Chunk: {} smp @ {} Hz\n\
+                                             • Active RSB Cushion Formula: max(Base Floor, Sensor × Multiplier + Stall Guard) (1-block toggle spikes damped)",
+                                            pkt.gpu_delay_ms,
+                                            pkt.ema_gpu_delay_ms,
+                                            pkt.min_gpu_delay_ms,
+                                            pkt.max_gpu_delay_ms,
+                                            pkt.hubert_ms,
+                                            pkt.rmvpe_ms,
+                                            pkt.synth_ms,
+                                            pkt.wsola_dsp_ms,
+                                            pkt.cushion_target_ms,
+                                            pkt.e2e_delay_ms,
+                                            pkt.block_frames,
+                                            pkt.sample_rate
+                                        )
+                                    } else {
+                                        "Live Adaptive Cushion Formula (v2.3 — 1:1 with DSP Execution):\n\
+                                         Active Cushion = max(Base Cushion Floor, Sensor Delay × Stall Multiplier + Stall Guard).\n\
+                                         Includes True-Silence Excess Trim (-56.5 dBFS) & +140ms hard lag recovery.".to_string()
+                                    });
 
                                     ui.add_space(4.0);
                                     let btn_drop = egui::Button::new(
@@ -4333,7 +5319,8 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                         AdaptiveCushionMode::AsioStopwatchOutlier => "2. Mode 2 — ASIO Stopwatch + Outlier",
                                         AdaptiveCushionMode::DecoupledPacing => "3. Mode 3 — Decoupled Pacing [P95]",
                                         AdaptiveCushionMode::HybridDualFusion => "4. Mode 4 — Hybrid [PySync + SW] (Default) ★",
-                                        AdaptiveCushionMode::PredictivePreemptivePlc => "5. Mode 5 — Predictive Pre-Emptive + PLC [Beta2]",
+                                        AdaptiveCushionMode::PredictivePreemptivePlc => "5. Mode 5 — Predictive Pre-Emptive + PLC",
+                                        AdaptiveCushionMode::OrionHybridFusion => "6. Mode 6 — ORION + SW GPU Delay ★",
                                     };
                                     egui::ComboBox::from_id_source("combo_adaptive_engine_mode")
                                         .width(235.0)
@@ -4367,7 +5354,12 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                             ui.selectable_value(
                                                 &mut cfg.adaptive_mode,
                                                 AdaptiveCushionMode::PredictivePreemptivePlc,
-                                                "5. Mode 5 — Predictive Pre-Emptive + Zero-Drop PLC [Beta2]",
+                                                "5. Mode 5 — Predictive Pre-Emptive + Zero-Drop PLC",
+                                            );
+                                            ui.selectable_value(
+                                                &mut cfg.adaptive_mode,
+                                                AdaptiveCushionMode::OrionHybridFusion,
+                                                "6. Mode 6 — ORION IPC Telemetry + SW [ORION + SW] ★",
                                             );
                                         });
 
@@ -4403,11 +5395,10 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                                     .color(Palette::ACCENT_BLUE),
                                             )
                                             .on_hover_text(
-                                                "Manual Extra Buffer Offset (Mode 1, 2, 3 & 4):\n\
-                                                 • 50ms + 25ms = 75ms\n\
-                                                 • 70ms + 25ms = 95ms\n\
-                                                 • 90ms + 25ms = 115ms\n\
-                                                 Active Cushion auto-adjusts assuming GPU Delay has reached (Sensor + Extra).",
+                                                "Legacy Extra Buffer Profile Field (kept for v2.0–v2.2 config compatibility):\n\
+                                                 In v2.3, Active Cushion & IASIO::getLatencies are driven 1:1 by:\n\
+                                                 max(Base Cushion Floor, Sensor Delay × Stall Multiplier + Stall Guard)\n\
+                                                 so live cushion & display stay strictly consistent without extra hidden lag.",
                                             );
 
                                             let btn_ex_dn = egui::Button::new(RichText::new("◀").size(9.0))
@@ -4463,7 +5454,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
 
                                 ui.add_space(5.0);
 
-                                // ROW 3: Base Cushion Floor (Full clean row — zero squeezing)
+                                // ROW 3: Base Cushion Floor (Full clean row — supports 0 ms for testing)
                                 ui.horizontal(|ui| {
                                     ui.add_sized(
                                         [118.0, 21.0],
@@ -4479,13 +5470,13 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                         .stroke(Stroke::new(1.0_f32, Palette::BORDER))
                                         .rounding(Rounding::same(4.0));
                                     if ui.add_sized([19.0, 21.0], btn_b_dn).clicked() {
-                                        cfg.dsp_b_cushion_ms = (cfg.dsp_b_cushion_ms - 5.0).clamp(20.0, 450.0);
+                                        cfg.dsp_b_cushion_ms = (cfg.dsp_b_cushion_ms - 5.0).clamp(0.0, 450.0);
                                     }
                                     ui.add_sized(
                                         [58.0, 21.0],
                                         egui::DragValue::new(&mut cfg.dsp_b_cushion_ms)
                                             .speed(1.0)
-                                            .clamp_range(20.0..=450.0)
+                                            .clamp_range(0.0..=450.0)
                                             .fixed_decimals(0)
                                             .suffix(" ms"),
                                     );
@@ -4494,11 +5485,13 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                         .stroke(Stroke::new(1.0_f32, Palette::BORDER))
                                         .rounding(Rounding::same(4.0));
                                     if ui.add_sized([19.0, 21.0], btn_b_up).clicked() {
-                                        cfg.dsp_b_cushion_ms = (cfg.dsp_b_cushion_ms + 5.0).clamp(20.0, 450.0);
+                                        cfg.dsp_b_cushion_ms = (cfg.dsp_b_cushion_ms + 5.0).clamp(0.0, 450.0);
                                     }
 
                                     for (preset_b, b_lbl) in [
-                                        (40.0_f32, "40ms"),
+                                        (0.0_f32, "0ms"),
+                                        (20.0, "20ms"),
+                                        (40.0, "40ms"),
                                         (60.0, "60ms ★"),
                                         (70.0, "70ms"),
                                         (90.0, "90ms"),
@@ -4510,7 +5503,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                             b_lbl,
                                             is_sel,
                                             Palette::ACCENT_GREEN,
-                                            if preset_b == 60.0 { 48.0 } else { 40.0 },
+                                            if preset_b == 60.0 { 48.0 } else if preset_b == 0.0 { 34.0 } else { 38.0 },
                                         )
                                         .clicked()
                                         {
@@ -4521,7 +5514,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
 
                                 ui.add_space(4.0);
 
-                                // ROW 4: Stall Multiplier (Full clean row — zero squeezing)
+                                // ROW 4: Stall Multiplier + Manual Stall Guard (ms)
                                 ui.add_enabled_ui(cfg.adaptive_cushion, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.add_sized(
@@ -4572,7 +5565,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                                 m_lbl,
                                                 is_sel,
                                                 Palette::ACCENT_PINK,
-                                                if (m_val - 1.15).abs() < 0.005 { 50.0 } else { 42.0 },
+                                                if (m_val - 1.15).abs() < 0.005 { 48.0 } else { 40.0 },
                                             )
                                             .clicked()
                                             {
@@ -4580,11 +5573,37 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                             }
                                         }
 
+                                        ui.add_space(4.0);
                                         ui.label(
-                                            RichText::new("(+15ms guard)")
-                                                .size(10.5)
-                                                .color(Palette::TEXT_MUTED),
+                                            RichText::new("Guard:")
+                                                .size(10.8)
+                                                .strong()
+                                                .color(Palette::TEXT_SECONDARY),
                                         );
+                                        let btn_g_dn = egui::Button::new(RichText::new("◀").size(8.5))
+                                            .fill(Palette::BG_INPUT)
+                                            .stroke(Stroke::new(1.0_f32, Palette::BORDER))
+                                            .rounding(Rounding::same(4.0));
+                                        if ui.add_sized([17.0, 21.0], btn_g_dn).clicked() {
+                                            cfg.stall_guard_ms = (cfg.stall_guard_ms - 1.0).clamp(0.0, 150.0);
+                                        }
+                                        ui.add_sized(
+                                            [56.0, 21.0],
+                                            egui::DragValue::new(&mut cfg.stall_guard_ms)
+                                                .speed(1.0)
+                                                .clamp_range(0.0..=150.0)
+                                                .fixed_decimals(0)
+                                                .prefix("+")
+                                                .suffix("ms"),
+                                        )
+                                        .on_hover_text("Manual Stall Guard (0–150 ms, default +15 ms): added after Stall Multiplier for testing.");
+                                        let btn_g_up = egui::Button::new(RichText::new("▶").size(8.5))
+                                            .fill(Palette::BG_INPUT)
+                                            .stroke(Stroke::new(1.0_f32, Palette::BORDER))
+                                            .rounding(Rounding::same(4.0));
+                                        if ui.add_sized([17.0, 21.0], btn_g_up).clicked() {
+                                            cfg.stall_guard_ms = (cfg.stall_guard_ms + 1.0).clamp(0.0, 150.0);
+                                        }
                                     });
                                 });
 
@@ -4688,7 +5707,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                     let w0 = cols[0].available_width().max(160.0);
                                     cols[0].horizontal(|ui| {
                                         ui.label(
-                                            RichText::new("🎤 Line A In (To Vonovox):")
+                                            RichText::new("🎤 Line A In (To External VC):")
                                                 .size(11.2)
                                                 .strong()
                                                 .color(Palette::ACCENT_PINK),
@@ -4717,7 +5736,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                     let w1 = cols[1].available_width().max(160.0);
                                     cols[1].horizontal(|ui| {
                                         ui.label(
-                                            RichText::new("🔊 Line B Out (From Vonovox):")
+                                            RichText::new("🔊 Line B Out (From External VC):")
                                                 .size(11.2)
                                                 .strong()
                                                 .color(Palette::ACCENT_GREEN),
@@ -4797,7 +5816,18 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
 
         if reset_optimal {
             cfg = DspRsbAsioConfig::default();
+            self.auto_reset_enabled = cfg.auto_reset_enabled;
+            self.auto_reset_interval_mins = cfg.auto_reset_interval_mins;
+            self.auto_reset_cooldown_mins = cfg.auto_reset_cooldown_mins;
+            self.auto_reset_coord.update_config_from_ui(
+                self.auto_reset_enabled,
+                self.auto_reset_interval_mins,
+                self.auto_reset_cooldown_mins,
+                false,
+            );
         }
+        cfg.auto_reset_enabled = self.auto_reset_enabled;
+        cfg.auto_reset_interval_mins = self.auto_reset_interval_mins.clamp(1, 240);
         cfg.sync_buffer_size_with_rsb = true;
         cfg.sync_sample_rate_with_rsb = true;
         cfg.manual_sample_rate = rsb_global_sr;
@@ -4813,9 +5843,10 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
         if dev_changed || cfg_changed || do_apply_popup || reset_optimal {
             set_asio_cpu_cores(cfg.asio_cpu_cores);
             cfg.micro_stretch_rescue = true;
-            cfg.dsp_b_cushion_ms = cfg.dsp_b_cushion_ms.clamp(20.0, 450.0);
+            cfg.dsp_b_cushion_ms = cfg.dsp_b_cushion_ms.clamp(0.0, 450.0);
             cfg.adaptive_extra_ms = cfg.adaptive_extra_ms.clamp(0.0, 250.0);
             cfg.gpu_stall_multiplier = cfg.gpu_stall_multiplier.clamp(1.00, 1.30);
+            cfg.stall_guard_ms = cfg.stall_guard_ms.clamp(0.0, 150.0);
 
             self.dsp_rsb_config = cfg.clone();
             self.pipeline_a.dsp_rsb_config = cfg.clone();
@@ -4830,6 +5861,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
             );
             get_dsp_rsb_bus_b_in().set_adaptive_mode(cfg.adaptive_mode as u8);
             get_dsp_rsb_bus_b_in().set_user_extra_buffer_ms(cfg.adaptive_extra_ms);
+            get_dsp_rsb_bus_b_in().set_user_stall_guard_ms(cfg.stall_guard_ms);
             get_dsp_rsb_bus_b_in().sync_config(
                 rsb_global_sr.max(44100),
                 cfg.buffer_size,
@@ -4875,11 +5907,11 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                 show_info_message_box(
                     "SoundBridge ASIO — Rinka SoundBridge ASIO",
                     &format!(
-                        "SoundBridge ASIO settings saved & applied without audio interruption!\n\n\
-                         • VC Driver in Vonovox : ASIO: {}\n\
+                        "SoundBridge ASIO (v2.3) settings saved & applied without audio interruption!\n\n\
+                         • VC Driver : ASIO: {}\n\
                          • Buffer Size (smp) : {} smp (Auto-Synced with RSB @ {} Hz)\n\
                          • ASIO CPU Cores : {}\n\
-                         • Adaptive Cushion : {} (Base {:.0} ms | Extra +{:.0} ms | Active {:.1} ms)\n\
+                         • Adaptive Cushion : {} (Base {:.0} ms | Active {:.1} ms)\n\
                          • Line A Input : {}\n\
                          • Line B Output : {}",
                         DSP_RSB_ASIO_DRIVER_NAME,
@@ -4887,12 +5919,11 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                         rsb_global_sr,
                         cpu_str,
                         if cfg.adaptive_cushion {
-                            format!("ON (x{:.2} + 15 ms | Extra +{:.0} ms)", cfg.gpu_stall_multiplier, cfg.adaptive_extra_ms)
+                            format!("ON (Sensor × {:.2} + {:.0} ms Guard)", cfg.gpu_stall_multiplier, cfg.stall_guard_ms)
                         } else {
-                            format!("Manual (+{:.0} ms Extra)", cfg.adaptive_extra_ms)
+                            "Manual (Base Floor Only)".to_string()
                         },
                         cfg.dsp_b_cushion_ms,
-                        cfg.adaptive_extra_ms,
                         active_cush_ms,
                         self.pipeline_a.input_device_name.as_deref().unwrap_or("(None)"),
                         self.pipeline_b.output_device_name.as_deref().unwrap_or("(None)"),
@@ -5151,7 +6182,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
 
                                         ui.add_space(8.0);
 
-                                        // Row 2: Latency | [x] Set Input Latency [0.0] | [x] Set Output Latency [0.0]
+                                        // Row 2: Latency | [x] Set Input Latency [0 ms] | [x] Set Output Latency [0 ms] (0..1000 ms)
                                         ui.horizontal(|ui| {
                                             ui.add_sized(
                                                 [label_col_w, 22.0],
@@ -5172,9 +6203,10 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                                     ui.add_enabled(
                                                         cfg.set_in_latency_enabled,
                                                         egui::DragValue::new(&mut cfg.in_latency_val)
-                                                            .speed(0.01)
-                                                            .clamp_range(0.0..=0.45)
-                                                            .fixed_decimals(2),
+                                                            .speed(1.0)
+                                                            .clamp_range(0.0..=1000.0)
+                                                            .fixed_decimals(0)
+                                                            .suffix(" ms"),
                                                     );
                                                 });
                                             });
@@ -5190,9 +6222,10 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                                                     ui.add_enabled(
                                                         cfg.set_out_latency_enabled,
                                                         egui::DragValue::new(&mut cfg.out_latency_val)
-                                                            .speed(0.01)
-                                                            .clamp_range(0.0..=0.45)
-                                                            .fixed_decimals(2),
+                                                            .speed(1.0)
+                                                            .clamp_range(0.0..=1000.0)
+                                                            .fixed_decimals(0)
+                                                            .suffix(" ms"),
                                                     );
                                                 });
                                             });
@@ -5386,7 +6419,18 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
 
         if reset_defaults {
             cfg = RsbAsioConfig::default();
+            self.auto_reset_enabled = cfg.auto_reset_enabled;
+            self.auto_reset_interval_mins = cfg.auto_reset_interval_mins;
+            self.auto_reset_cooldown_mins = cfg.auto_reset_cooldown_mins;
+            self.auto_reset_coord.update_config_from_ui(
+                self.auto_reset_enabled,
+                self.auto_reset_interval_mins,
+                self.auto_reset_cooldown_mins,
+                false,
+            );
         }
+        cfg.auto_reset_enabled = self.auto_reset_enabled;
+        cfg.auto_reset_interval_mins = self.auto_reset_interval_mins.clamp(1, 240);
         cfg.input_device = sel_in_a.clone();
         cfg.output_device = sel_out_b.clone();
         cfg.buffer_size = cfg.effective_buffer_size(rsb_global_buf);
@@ -5428,7 +6472,7 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                     &format!(
                         "RSB ASIO (Built-in FlexASIO GUI) configuration saved!
 
-                         • Driver Name in Vonovox : ASIO: {}
+                         • Driver Name in External VC : ASIO: {}
                          • Backend : Windows WASAPI
                          • Buffer Size : {} samples ({})
                          • Input Device : {} (Latency: {})
@@ -5437,9 +6481,9 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
                         cfg.buffer_size,
                         if cfg.sync_buffer_size_with_rsb { "Auto-Synced with RSB" } else { "Manual" },
                         if sel_in_a.is_empty() { "(None)" } else { &sel_in_a },
-                        if cfg.set_in_latency_enabled { format!("{:.1} s", cfg.in_latency_val) } else { "Auto".into() },
+                        if cfg.set_in_latency_enabled { format!("{:.0} ms", cfg.in_latency_val) } else { "Auto".into() },
                         if sel_out_b.is_empty() { "(None)" } else { &sel_out_b },
-                        if cfg.set_out_latency_enabled { format!("{:.1} s", cfg.out_latency_val) } else { "Auto".into() },
+                        if cfg.set_out_latency_enabled { format!("{:.0} ms", cfg.out_latency_val) } else { "Auto".into() },
                     ),
                 );
             }
@@ -5457,10 +6501,26 @@ If any VST plugin errors or crashes during processing, this Line's audio output 
 impl eframe::App for RinkaSoundBridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         enable_cpu_denormal_flush();
-        restore_host_gl_context();
         self.periodic_background_tasks(ctx);
-        restore_host_gl_context();
-        ctx.request_repaint_after(Duration::from_millis(33));
+        if is_main_window_hidden_or_minimized(APP_WINDOW_TITLE) {
+            ctx.request_repaint_after(Duration::from_millis(500));
+            return;
+        }
+        let focused = ctx.input(|i| i.focused);
+        let user_interacting = ctx.input(|i| i.pointer.any_down() || i.pointer.is_moving());
+        let meter_active = self.smooth_peak_a > 0.002
+            || self.smooth_peak_b > 0.002
+            || self.pipeline_a.peak_level() > 0.002
+            || self.pipeline_b.peak_level() > 0.002;
+        ctx.request_repaint_after(Duration::from_millis(if user_interacting {
+            30
+        } else if meter_active {
+            if focused { 75 } else { 110 }
+        } else if focused {
+            200
+        } else {
+            333
+        }));
 
         // Panel Bawah: Indikator Delay Voice Changer & Live2D (L2D) dengan fitur Toggle Hide/Show
         // Dirender menggunakan TopBottomPanel::bottom agar ruangnya selalu dipesan lebih dulu dan TIDAK PERNAH terpotong!
@@ -5488,31 +6548,16 @@ impl eframe::App for RinkaSoundBridgeApp {
                 if self.show_delay_bar {
                     let est_a = self.pipeline_a.estimated_line_latency_ms();
                     let est_b = self.pipeline_b.estimated_line_latency_ms();
-                    let is_sb_asio = self.pipeline_a.driver_backend == DriverBackend::AsioDspRsb;
-                    let is_rsb_asio = self.pipeline_a.driver_backend == DriverBackend::RsbAsio;
-                    let bridge_cush_ms = if is_rsb_asio {
-                        None
-                    } else if is_sb_asio {
-                        let sr_f = self.pipeline_b.effective_sample_rate().max(44100) as f64;
-                        let (c_smp, _) = get_dsp_rsb_bus_b_in().get_dsp_b_params();
-                        Some((c_smp as f64 / sr_f) * 1000.0)
-                    } else {
-                        None
-                    };
-
-                    // Nilai utama In A -> Out B: prioritaskan hasil korelasi suara aktual; jika belum bicara,
-                    // tampilkan estimasi gabungan (Line A + Line B + Cushion) untuk acuan Live2D!
-                    let (main_lat_str, mode_badge) = if let Some(ms) = self.lat_peak_ms {
-                        (format!("{:.1} ms", ms), "Measured")
-                    } else if let (Some(a), Some(b)) = (est_a, est_b) {
-                        let c = bridge_cush_ms.unwrap_or(0.0);
-                        (format!("~{:.1} ms", a + b + c), "Estimated")
-                    } else if let Some(a) = est_a {
-                        (format!("~{:.1} ms", a), "Line A")
-                    } else if let Some(b) = est_b {
-                        (format!("~{:.1} ms", b), "Line B")
-                    } else {
-                        ("-- ms".to_string(), "Idle")
+                    // Sumber tunggal (1:1 dengan OBS Overlay): sinkronkan nilai terkini & hitung lewat ObsDelaySharedState
+                    let (main_lat_str, mode_badge, bridge_cush_ms) = {
+                        let mut st = self.obs_shared.lock();
+                        st.est_a_ms = est_a;
+                        st.est_b_ms = est_b;
+                        st.hw_dma_ms = self.pipeline_a.estimated_hw_quantum_ms()
+                            + self.pipeline_b.estimated_hw_quantum_ms();
+                        st.driver_backend = self.pipeline_a.driver_backend;
+                        st.sample_rate_b = self.pipeline_b.effective_sample_rate().max(44100);
+                        st.compute_main_lat_with_badge()
                     };
 
                     let detail_str = if let Some(c_ms) = bridge_cush_ms {
@@ -5531,10 +6576,12 @@ impl eframe::App for RinkaSoundBridgeApp {
                     };
 
                     let l2d_tip = format!(
-                        "Live2D / VTube Studio / OBS Delay Calibration Guide:
+                        "Live2D / VTube Studio / OBS Delay Calibration Guide (v2.3):
                         - Total Delay (In A -> Out B): {} ({})
-                        - Line A Pipeline Estimate (Buffer + FIFO + VST): {}
-                        - Line B Pipeline Estimate (Buffer + FIFO + VST): {}
+                          • 'Measured' = true un-clamped acoustic cross-correlation (2.8s cross-SR LatencyProbe w/ timestamp skew compensation & 3-pt parabolic interpolation) + actual Line A/B HW DMA.
+                          • 'Estimated' = Line A + ORION Internal + Physical Bridge Fill + Line B (incl. true unclamped VST3 PDC, e.g., Clear.vst3 68 ms).
+                        - Line A Pipeline Estimate (HW + Lock-Free SPSC FIFO + VST3 PDC): {}
+                        - Line B Pipeline Estimate (HW + Lock-Free SPSC FIFO + VST3 PDC): {}
 
                         Tip: Enter this ms value into your Audio/Lip-Sync Delay setting in Live2D / VTube Studio
                         so your character's mouth movement stays in sync with the processed voice.",
@@ -5543,6 +6590,92 @@ impl eframe::App for RinkaSoundBridgeApp {
                         est_a.map(|v| format!("{:.1} ms", v)).unwrap_or_else(|| "Off".into()),
                         est_b.map(|v| format!("{:.1} ms", v)).unwrap_or_else(|| "Off".into()),
                     );
+
+                    // Baris Informasi Timer Reset & Cooldown tepat di atas tempat informasi kalkulasi delay!
+                    {
+                        let now_b = Instant::now();
+                        let up_b = now_b
+                            .saturating_duration_since(self.last_auto_reset_ts)
+                            .as_secs();
+                        let cd_total_s = (self.auto_reset_cooldown_mins.clamp(1, 240) as u64) * 60;
+                        let iv_total_s = (self.auto_reset_interval_mins.clamp(1, 240) as u64) * 60;
+                        let cd_rem_s = cd_total_s.saturating_sub(up_b);
+                        let iv_rem_s = iv_total_s.saturating_sub(up_b);
+                        let sil_b = self
+                            .line_b_silent_since
+                            .map(|t| now_b.saturating_duration_since(t).as_secs_f32())
+                            .unwrap_or(0.0);
+                        let is_flash_b = self
+                            .auto_reset_flash_until
+                            .map(|t| now_b < t)
+                            .unwrap_or(false);
+
+                        let (timer_bar_txt, timer_bar_col) = if is_flash_b {
+                            (
+                                format!(
+                                    "🔴 AUTO-RESET #{} COMPLETED  |  Next 1.2s Cooldown: {} min  |  Target Timer: {} min (Synced w/ ORION)",
+                                    self.auto_reset_count,
+                                    self.auto_reset_cooldown_mins,
+                                    self.auto_reset_interval_mins
+                                ),
+                                Palette::ACCENT_CORAL,
+                            )
+                        } else if !self.auto_reset_enabled {
+                            (
+                                "⚪ Auto-Reset Timer (Synced RSB ↔ ORION): OFF".to_string(),
+                                Palette::TEXT_MUTED,
+                            )
+                        } else if cd_rem_s > 0 {
+                            (
+                                if ui.available_width() < 950.0 {
+                                    format!(
+                                        "🔄 CD (1.2s Lock): {:02}:{:02}/{:02}:00 | Target: {:02}:{:02}/{:02}:00 | Silent B: Locked (CD) | #{}",
+                                        cd_rem_s / 60,
+                                        cd_rem_s % 60,
+                                        self.auto_reset_cooldown_mins,
+                                        iv_rem_s / 60,
+                                        iv_rem_s % 60,
+                                        self.auto_reset_interval_mins,
+                                        self.auto_reset_count
+                                    )
+                                } else {
+                                    format!(
+                                        "🔄 Auto-Reset Cooldown (1.2s Lock): {:02}:{:02} / {:02}:00  |  Target Timer: {:02}:{:02} / {:02}:00  |  Silent Line B: Locked (Wait CD)  |  Resets: #{}",
+                                        cd_rem_s / 60,
+                                        cd_rem_s % 60,
+                                        self.auto_reset_cooldown_mins,
+                                        iv_rem_s / 60,
+                                        iv_rem_s % 60,
+                                        self.auto_reset_interval_mins,
+                                        self.auto_reset_count
+                                    )
+                                },
+                                Palette::ACCENT_BLUE,
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "🟢 Cooldown Done ({}m) — Armed for >= 1.2s Silence (Current: {:.1}s / 1.2s)  |  Target Timer: {:02}:{:02}  |  Resets: #{}",
+                                    self.auto_reset_cooldown_mins,
+                                    sil_b.min(9.9),
+                                    iv_rem_s / 60,
+                                    iv_rem_s % 60,
+                                    self.auto_reset_count
+                                ),
+                                Palette::ACCENT_GREEN,
+                            )
+                        };
+
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new(timer_bar_txt)
+                                    .font(FontId::new(11.0, FontFamily::Monospace))
+                                    .strong()
+                                    .color(timer_bar_col),
+                            );
+                        });
+                        ui.add_space(2.0);
+                    }
 
                     ui.horizontal(|ui| {
                         // Tombol Toggle Hide di kiri
@@ -5630,13 +6763,12 @@ impl eframe::App for RinkaSoundBridgeApp {
                             .rounding(Rounding::same(6.0));
                             if ui
                                 .add_sized([68.0, 26.0], btn_rst)
-                                .on_hover_text("Reset measured peak delay (ms) & resync Cushion to Vonovox")
+                                .on_hover_text("Reset ONLY the measured delay (ms) calculation without resetting RSB audio streams or cushion")
                                 .clicked()
                             {
-                                self.lat_peak_ms = None;
-                                self.lat_current_ms = None;
-                                get_dsp_rsb_bus_b_in().reset_spike_and_resync_cushion();
-                                rinka_soundbridge_core::asio_host::inject_probe_into_running_vonovox_if_needed();
+                                self.pipeline_a.shared.probe_in.clear();
+                                self.pipeline_b.shared.probe_out.clear();
+                                self.reset_measured_delay();
                             }
                         });
                     });
@@ -5665,27 +6797,31 @@ impl eframe::App for RinkaSoundBridgeApp {
                 egui::Frame::none()
                     .fill(Palette::BG_APP)
                     .inner_margin(Margin {
-                        left: 14.0,
-                        right: 14.0,
-                        top: 12.0,
+                        left: 10.0,
+                        right: 10.0,
+                        top: 8.0,
                         bottom: 4.0,
                     }),
             )
             .show(ctx, |ui| {
-                self.render_header(ui, ctx);
-                ui.add_space(8.0);
+                egui::ScrollArea::vertical()
+                    .id_source("rsb_main_vertical_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.render_header(ui, ctx);
+                        ui.add_space(6.0);
 
-                ui.columns(2, |cols| {
-                    self.render_line_panel(&mut cols[0], ActiveLineTarget::LineA);
-                    self.render_line_panel(&mut cols[1], ActiveLineTarget::LineB);
-                });
+                        ui.columns(2, |cols| {
+                            self.render_line_panel(&mut cols[0], ActiveLineTarget::LineA);
+                            self.render_line_panel(&mut cols[1], ActiveLineTarget::LineB);
+                        });
+                    });
             });
 
         self.render_vst_picker_modal(ctx);
         self.render_triple_asio_setting_modal(ctx);
         self.render_dsp_rsb_setting_modal(ctx);
         self.render_rsb_asio_setting_modal(ctx);
-        restore_host_gl_context();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -5696,7 +6832,23 @@ impl eframe::App for RinkaSoundBridgeApp {
     }
 }
 
+// Hint Windows Graphics / NVIDIA Optimus to run RSB 2D UI without discrete GPU contention
+#[no_mangle]
+pub static NvOptimusEnablement: u32 = 0x0000_0000;
+#[no_mangle]
+pub static AmdPowerXpressRequestHighPerformance: i32 = 0;
+
 fn main() -> eframe::Result<()> {
+    // Isolate Rinka SoundBridge & child VST3 plugins (e.g. Supertone Clear ONNX Runtime) from ORIONs CUDA GPU!
+    // Prevents Clear.vst3 or ONNX/DirectML from opening a competing CUDA/DirectML context on the RTX 3080,
+    // keeping ORION FP32 at ~18ms even while Rinka SoundBridge is open!
+    std::env::set_var("CUDA_VISIBLE_DEVICES", "-1");
+    std::env::set_var("ORT_DIRECTML_DEVICE_ID", "-1");
+    std::env::set_var("GGML_CUDA_NO_PINNED", "1");
+    std::env::set_var("__GL_Yield", "USLEEP");
+    std::env::set_var("__GL_THREADED_OPTIMIZATIONS", "0");
+    ensure_igpu_power_saving_preference_if_unset();
+
     install_crash_handlers();
 
     let args: Vec<String> = std::env::args().collect();
@@ -5746,8 +6898,15 @@ fn main() -> eframe::Result<()> {
         }
     }
 
+    // Route RinkaSoundBridge GUI OpenGL context to Integrated GPU (iGPU) on hybrid laptops so it uses 0% of the NVIDIA CUDA GPU!
+    std::env::set_var("SHIM_MCCOMPAT", "0x800000000");
+
     let options = eframe::NativeOptions {
         viewport,
+        vsync: false,
+        multisampling: 0,
+        depth_buffer: 0,
+        stencil_buffer: 0,
         ..Default::default()
     };
 
@@ -5756,4 +6915,78 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Box::new(RinkaSoundBridgeApp::new(cc))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cors_origin_validation_strict_loopback_only() {
+        // Exact allowed loopback HTTP origins (with or without valid port)
+        assert!(is_allowed_loopback_cors_origin("http://localhost"));
+        assert!(is_allowed_loopback_cors_origin("http://localhost:80"));
+        assert!(is_allowed_loopback_cors_origin("http://localhost:49812"));
+        assert!(is_allowed_loopback_cors_origin("http://127.0.0.1"));
+        assert!(is_allowed_loopback_cors_origin("http://127.0.0.1:49812"));
+        assert!(is_allowed_loopback_cors_origin("http://127.0.0.1:1"));
+        assert!(is_allowed_loopback_cors_origin("http://127.0.0.1:65535"));
+
+        // Rejected origins (subdomain spoofing, null, non-http, invalid ports, path/CRLF injection)
+        assert!(!is_allowed_loopback_cors_origin("null"));
+        assert!(!is_allowed_loopback_cors_origin(""));
+        assert!(!is_allowed_loopback_cors_origin("http://localhost.evil.com"));
+        assert!(!is_allowed_loopback_cors_origin("http://localhost.evil.com:49812"));
+        assert!(!is_allowed_loopback_cors_origin("http://127.0.0.1.evil.com"));
+        assert!(!is_allowed_loopback_cors_origin("https://localhost"));
+        assert!(!is_allowed_loopback_cors_origin("https://127.0.0.1:49812"));
+        assert!(!is_allowed_loopback_cors_origin("file://"));
+        assert!(!is_allowed_loopback_cors_origin("http://localhost:"));
+        assert!(!is_allowed_loopback_cors_origin("http://localhost:0"));
+        assert!(!is_allowed_loopback_cors_origin("http://localhost:65536"));
+        assert!(!is_allowed_loopback_cors_origin("http://localhost:8080/path"));
+        assert!(!is_allowed_loopback_cors_origin("http://localhost@evil.com"));
+        assert!(!is_allowed_loopback_cors_origin("http://localhost:8080\r\nX-Injected: 1"));
+        assert!(!is_allowed_loopback_cors_origin("http://127.0.0.1:8080 "));
+    }
+
+    #[test]
+    fn test_obs_delay_measured_badge_is_never_falsely_clamped() {
+        let mut st = ObsDelaySharedState::new();
+        st.driver_backend = DriverBackend::RsbAsio;
+        st.est_a_ms = Some(15.0);
+        st.est_b_ms = Some(15.0);
+        st.hw_dma_ms = 20.0;
+        // Suppose actual acoustic delay is 490.0 ms (far above a small structural estimate):
+        st.lat_peak_ms = Some(470.0);
+        let (disp, badge, cush) = st.compute_main_lat_with_badge();
+        assert_eq!(badge, "Measured");
+        assert_eq!(disp, "490.0 ms");
+        assert!(cush.is_some(), "RsbAsio must report bridge cushion instead of None");
+    }
+
+    #[test]
+    fn test_bug2_structural_floor_ignores_stale_bus_a_when_vc_inactive() {
+        let bus_a = get_dsp_rsb_bus_a_out();
+        bus_a.reset();
+        bus_a.mark_vc_heartbeat(false);
+        // Simulate RSB Line A actively writing 1000ms of audio while ORION/VC is stopped (!is_vc_active)
+        let dummy = vec![0.01f32; 48_000];
+        bus_a.write_stereo(&dummy, &dummy, 48_000);
+        assert!(bus_a.is_writer_active());
+        assert!(!bus_a.is_vc_active());
+
+        let mut st = ObsDelaySharedState::new();
+        st.driver_backend = DriverBackend::OrionDirect;
+        st.est_a_ms = Some(78.0);
+        st.est_b_ms = Some(13.2);
+        let (sf, _, cush) = st.structural_floor_and_parts();
+        bus_a.mark_writer_stopped();
+        bus_a.reset();
+
+        assert!(
+            sf < 250.0,
+            "Stale bus_a fill (1000 ms) must be ignored when VC is inactive; got sf={sf:.1} ms (cush={cush:?})"
+        );
+    }
 }

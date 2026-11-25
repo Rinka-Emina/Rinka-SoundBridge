@@ -3,8 +3,8 @@ setlocal
 cd /d "%~dp0"
 
 echo ============================================================================
-echo   Rinka SoundBridge v2.0 - FULL RUST NATIVE BUILDER (MSVC x86_64)
-echo   ASIO DSP RSB Pro Architecture + Zero-Blackout Audio Engine
+echo   Rinka SoundBridge v2.3 (NEON) - FULL RUST NATIVE BUILDER (MSVC x86_64)
+echo   Lock-Free SPSC Engine + ASIO DSP RSB Pro Architecture
 echo ============================================================================
 echo.
 
@@ -120,8 +120,8 @@ echo   Savedata: dist\Savedata\
 echo   Modules:  dist\Modules\rinka_soundbridge_core.dll
 echo   Logs:     dist\Logs\
 echo.
-echo   IMPORTANT: If Vonovox or your DAW is currently open, please click "Stop"
-echo   and "Reload Devices" (or restart Vonovox) so it loads the updated DLL!
+echo   IMPORTANT: If your AI Voice Changer or DAW is currently open, please click "Stop"
+echo   and "Reload Devices" (or restart your Voice Changer / DAW) so it loads the updated DLL!
 echo ============================================================================
 echo.
 start "" "dist\RinkaSoundBridge.exe"

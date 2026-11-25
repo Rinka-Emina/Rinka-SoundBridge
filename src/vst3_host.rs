@@ -15,7 +15,7 @@
 
 #![allow(non_snake_case, non_camel_case_types, non_upper_case_globals, dead_code)]
 
-use crate::logger::{log_info, reassert_crash_handlers, record_breadcrumb};
+use crate::logger::{log_error, log_info, reassert_crash_handlers, record_breadcrumb};
 use crate::win32::{restore_host_gl_context, trim_process_working_set, OpenGlContextGuard};
 use libloading::Library;
 use parking_lot::Mutex;
@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::{c_char, c_void, CStr};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,11 +32,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// Mencegah DLL `.vst3` di-unload (`FreeLibrary`) di tengah sesi ketika masih ada vtable/timer/OpenGL
 /// atau instance kedua di Line lain, serta memastikan `InitDll` hanya dipanggil satu kali per DLL!
 static LOADED_VST3_MODULES: OnceLock<Mutex<HashMap<PathBuf, Arc<Library>>>> = OnceLock::new();
-
-/// Daftar editor GUI VST yang sudah ditutup/dihapus namun menggunakan konteks OpenGL/child HWND
-/// yang diparkir dalam keadaan tersembunyi (`SW_HIDE`) hingga aplikasi keluar agar tidak memicu
-/// crash destructor OpenGL (`baseview` / `nih-plug` / `JUCE`) di tengah sesi.
-static RETIRED_VST_EDITORS: OnceLock<Mutex<Vec<(usize, usize, usize)>>> = OnceLock::new();
 
 fn get_or_load_vst3_library(bin_path: &Path) -> Result<Arc<Library>, String> {
     let cache = LOADED_VST3_MODULES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -159,6 +154,10 @@ pub const K_RESULT_FALSE: TResult = 1;
 pub const K_NO_INTERFACE: TResult = -1;
 pub const K_INVALID_ARGUMENT: TResult = -2;
 pub const K_NOT_IMPLEMENTED: TResult = -4;
+pub const K_INTERNAL_ERROR: TResult = -5;
+pub const K_OUT_OF_MEMORY: TResult = -6;
+pub const MAX_BSTREAM_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_ATTR_BINARY_BYTES: usize = 16 * 1024 * 1024;
 
 pub type TUID = [u8; 16];
 
@@ -523,16 +522,19 @@ pub struct MemoryBStream {
 }
 
 unsafe extern "system" fn bstream_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> TResult {
-    if iid.is_null() || obj.is_null() {
-        return K_NO_INTERFACE;
-    }
-    let id = &*iid;
-    if IID_FUNKNOWN.matches(id) || IID_IBSTREAM.matches(id) {
-        *obj = this;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || iid.is_null() || obj.is_null() {
+            return K_NO_INTERFACE;
+        }
+        let id = &*iid;
+        if IID_FUNKNOWN.matches(id) || IID_IBSTREAM.matches(id) {
+            *obj = this;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn noop_add_ref(_this: *mut c_void) -> u32 { 1 }
 unsafe extern "system" fn noop_release(_this: *mut c_void) -> u32 { 1 }
@@ -543,20 +545,23 @@ unsafe extern "system" fn bstream_read(
     num_bytes: i32,
     bytes_read: *mut i32,
 ) -> TResult {
-    if buffer.is_null() || num_bytes < 0 {
-        return K_INVALID_ARGUMENT;
-    }
-    let s = &mut *(this as *mut MemoryBStream);
-    let avail = s.data.len().saturating_sub(s.cursor);
-    let to_read = (num_bytes as usize).min(avail);
-    if to_read > 0 {
-        ptr::copy_nonoverlapping(s.data.as_ptr().add(s.cursor), buffer as *mut u8, to_read);
-        s.cursor += to_read;
-    }
-    if !bytes_read.is_null() {
-        *bytes_read = to_read as i32;
-    }
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || buffer.is_null() || num_bytes < 0 {
+            return K_INVALID_ARGUMENT;
+        }
+        let s = &mut *(this as *mut MemoryBStream);
+        let avail = s.data.len().saturating_sub(s.cursor);
+        let to_read = (num_bytes as usize).min(avail);
+        if to_read > 0 {
+            ptr::copy_nonoverlapping(s.data.as_ptr().add(s.cursor), buffer as *mut u8, to_read);
+            s.cursor += to_read;
+        }
+        if !bytes_read.is_null() {
+            *bytes_read = to_read as i32;
+        }
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 unsafe extern "system" fn bstream_write(
@@ -565,23 +570,34 @@ unsafe extern "system" fn bstream_write(
     num_bytes: i32,
     bytes_written: *mut i32,
 ) -> TResult {
-    if buffer.is_null() || num_bytes < 0 {
-        return K_INVALID_ARGUMENT;
-    }
-    let s = &mut *(this as *mut MemoryBStream);
-    let n = num_bytes as usize;
-    let end = s.cursor + n;
-    if end > s.data.len() {
-        s.data.resize(end, 0);
-    }
-    if n > 0 {
-        ptr::copy_nonoverlapping(buffer as *const u8, s.data.as_mut_ptr().add(s.cursor), n);
-        s.cursor += n;
-    }
-    if !bytes_written.is_null() {
-        *bytes_written = n as i32;
-    }
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || buffer.is_null() || num_bytes < 0 {
+            return K_INVALID_ARGUMENT;
+        }
+        let s = &mut *(this as *mut MemoryBStream);
+        let n = num_bytes as usize;
+        let Some(end) = s.cursor.checked_add(n) else {
+            return K_INVALID_ARGUMENT;
+        };
+        if end > MAX_BSTREAM_BYTES {
+            return K_OUT_OF_MEMORY;
+        }
+        if end > s.data.len() {
+            if s.data.try_reserve(end - s.data.len()).is_err() {
+                return K_OUT_OF_MEMORY;
+            }
+            s.data.resize(end, 0);
+        }
+        if n > 0 {
+            ptr::copy_nonoverlapping(buffer as *const u8, s.data.as_mut_ptr().add(s.cursor), n);
+            s.cursor = end;
+        }
+        if !bytes_written.is_null() {
+            *bytes_written = n as i32;
+        }
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 unsafe extern "system" fn bstream_seek(
@@ -590,28 +606,43 @@ unsafe extern "system" fn bstream_seek(
     mode: i32,
     result: *mut i64,
 ) -> TResult {
-    let s = &mut *(this as *mut MemoryBStream);
-    let base: i64 = match mode {
-        0 => 0,                      // kIBSeekSet
-        1 => s.cursor as i64,        // kIBSeekCur
-        2 => s.data.len() as i64,    // kIBSeekEnd
-        _ => return K_INVALID_ARGUMENT,
-    };
-    let new_pos = (base + pos).max(0) as usize;
-    s.cursor = new_pos.min(s.data.len());
-    if !result.is_null() {
-        *result = s.cursor as i64;
-    }
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let s = &mut *(this as *mut MemoryBStream);
+        let base: i64 = match mode {
+            0 => 0,                      // kIBSeekSet
+            1 => s.cursor as i64,        // kIBSeekCur
+            2 => s.data.len() as i64,    // kIBSeekEnd
+            _ => return K_INVALID_ARGUMENT,
+        };
+        let Some(target) = base.checked_add(pos) else {
+            return K_INVALID_ARGUMENT;
+        };
+        if target < 0 {
+            return K_INVALID_ARGUMENT;
+        }
+        let new_pos = (target as usize).min(s.data.len());
+        s.cursor = new_pos;
+        if !result.is_null() {
+            *result = s.cursor as i64;
+        }
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 unsafe extern "system" fn bstream_tell(this: *mut c_void, pos: *mut i64) -> TResult {
-    if pos.is_null() {
-        return K_INVALID_ARGUMENT;
-    }
-    let s = &*(this as *mut MemoryBStream);
-    *pos = s.cursor as i64;
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || pos.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let s = &*(this as *mut MemoryBStream);
+        *pos = s.cursor as i64;
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 static BSTREAM_VTBL: IBStreamVtbl = IBStreamVtbl {
@@ -659,6 +690,8 @@ struct AttrInner {
     floats: HashMap<String, f64>,
     strings: HashMap<String, Vec<u16>>,
     binaries: HashMap<String, Box<[u8]>>,
+    /// Keeps overwritten binary slices alive for the lifetime of HostAttributeList so pointers returned by `getBinary` never UAF.
+    retired_binaries: Vec<Box<[u8]>>,
 }
 
 #[repr(C)]
@@ -677,98 +710,138 @@ unsafe fn attr_key(id: *const c_char) -> String {
 }
 
 unsafe extern "system" fn attr_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> TResult {
-    if iid.is_null() || obj.is_null() {
-        return K_NO_INTERFACE;
-    }
-    let id = &*iid;
-    if IID_FUNKNOWN.matches(id) || IID_IATTRIBUTELIST.matches(id) {
-        attr_add_ref(this);
-        *obj = this;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || iid.is_null() || obj.is_null() {
+            return K_NO_INTERFACE;
+        }
+        let id = &*iid;
+        if IID_FUNKNOWN.matches(id) || IID_IATTRIBUTELIST.matches(id) {
+            attr_add_ref(this);
+            *obj = this;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn attr_add_ref(this: *mut c_void) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
     let a = &*(this as *mut HostAttributeList);
     a.ref_count.fetch_add(1, Ordering::Relaxed) + 1
 }
 unsafe extern "system" fn attr_release(this: *mut c_void) -> u32 {
-    let a = &*(this as *mut HostAttributeList);
-    let prev = a.ref_count.fetch_sub(1, Ordering::Release);
-    if prev == 1 {
-        std::sync::atomic::fence(Ordering::Acquire);
-        let _ = Box::from_raw(this as *mut HostAttributeList);
-        0
-    } else {
-        prev - 1
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return 0;
+        }
+        let a = &*(this as *mut HostAttributeList);
+        let prev = a.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 0 {
+            a.ref_count.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        if prev == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            let _ = Box::from_raw(this as *mut HostAttributeList);
+            0
+        } else {
+            prev - 1
+        }
+    }))
+    .unwrap_or(0)
 }
 unsafe extern "system" fn attr_set_int(this: *mut c_void, id: *const c_char, value: i64) -> TResult {
-    let a = &*(this as *mut HostAttributeList);
-    a.inner.lock().ints.insert(attr_key(id), value);
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let a = &*(this as *mut HostAttributeList);
+        a.inner.lock().ints.insert(attr_key(id), value);
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn attr_get_int(this: *mut c_void, id: *const c_char, value: *mut i64) -> TResult {
-    if value.is_null() {
-        return K_INVALID_ARGUMENT;
-    }
-    let a = &*(this as *mut HostAttributeList);
-    if let Some(&v) = a.inner.lock().ints.get(&attr_key(id)) {
-        *value = v;
-        K_RESULT_OK
-    } else {
-        K_RESULT_FALSE
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || value.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let a = &*(this as *mut HostAttributeList);
+        if let Some(&v) = a.inner.lock().ints.get(&attr_key(id)) {
+            *value = v;
+            K_RESULT_OK
+        } else {
+            K_RESULT_FALSE
+        }
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn attr_set_float(this: *mut c_void, id: *const c_char, value: f64) -> TResult {
-    let a = &*(this as *mut HostAttributeList);
-    a.inner.lock().floats.insert(attr_key(id), value);
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let a = &*(this as *mut HostAttributeList);
+        a.inner.lock().floats.insert(attr_key(id), value);
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn attr_get_float(this: *mut c_void, id: *const c_char, value: *mut f64) -> TResult {
-    if value.is_null() {
-        return K_INVALID_ARGUMENT;
-    }
-    let a = &*(this as *mut HostAttributeList);
-    if let Some(&v) = a.inner.lock().floats.get(&attr_key(id)) {
-        *value = v;
-        K_RESULT_OK
-    } else {
-        K_RESULT_FALSE
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || value.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let a = &*(this as *mut HostAttributeList);
+        if let Some(&v) = a.inner.lock().floats.get(&attr_key(id)) {
+            *value = v;
+            K_RESULT_OK
+        } else {
+            K_RESULT_FALSE
+        }
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn attr_set_string(this: *mut c_void, id: *const c_char, s: *const u16) -> TResult {
-    if s.is_null() {
-        return K_INVALID_ARGUMENT;
-    }
-    let mut len = 0usize;
-    while len < 4096 && *s.add(len) != 0 {
-        len += 1;
-    }
-    let mut vec = Vec::with_capacity(len + 1);
-    for i in 0..len {
-        vec.push(*s.add(i));
-    }
-    vec.push(0);
-    let a = &*(this as *mut HostAttributeList);
-    a.inner.lock().strings.insert(attr_key(id), vec);
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || s.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let mut len = 0usize;
+        while len < 4096 && *s.add(len) != 0 {
+            len += 1;
+        }
+        let mut vec = Vec::with_capacity(len + 1);
+        for i in 0..len {
+            vec.push(*s.add(i));
+        }
+        vec.push(0);
+        let a = &*(this as *mut HostAttributeList);
+        a.inner.lock().strings.insert(attr_key(id), vec);
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn attr_get_string(this: *mut c_void, id: *const c_char, s: *mut u16, sz: u32) -> TResult {
-    if s.is_null() || sz < 2 {
-        return K_INVALID_ARGUMENT;
-    }
-    let a = &*(this as *mut HostAttributeList);
-    if let Some(vec) = a.inner.lock().strings.get(&attr_key(id)) {
-        let max_chars = (sz as usize / 2).saturating_sub(1);
-        let copy_len = vec.len().min(max_chars);
-        ptr::copy_nonoverlapping(vec.as_ptr(), s, copy_len);
-        *s.add(copy_len) = 0;
-        K_RESULT_OK
-    } else {
-        K_RESULT_FALSE
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || s.is_null() || sz < 2 {
+            return K_INVALID_ARGUMENT;
+        }
+        let a = &*(this as *mut HostAttributeList);
+        if let Some(vec) = a.inner.lock().strings.get(&attr_key(id)) {
+            let max_chars = (sz as usize / 2).saturating_sub(1);
+            let copy_len = vec.len().min(max_chars);
+            ptr::copy_nonoverlapping(vec.as_ptr(), s, copy_len);
+            *s.add(copy_len) = 0;
+            K_RESULT_OK
+        } else {
+            K_RESULT_FALSE
+        }
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn attr_set_binary(
     this: *mut c_void,
@@ -776,13 +849,33 @@ unsafe extern "system" fn attr_set_binary(
     data: *const c_void,
     size: u32,
 ) -> TResult {
-    let a = &*(this as *mut HostAttributeList);
-    let mut vec = vec![0u8; size as usize];
-    if !data.is_null() && size > 0 {
-        ptr::copy_nonoverlapping(data as *const u8, vec.as_mut_ptr(), size as usize);
-    }
-    a.inner.lock().binaries.insert(attr_key(id), vec.into_boxed_slice());
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let sz = size as usize;
+        if sz > MAX_ATTR_BINARY_BYTES {
+            return K_OUT_OF_MEMORY;
+        }
+        let mut vec = Vec::new();
+        if vec.try_reserve_exact(sz).is_err() {
+            return K_OUT_OF_MEMORY;
+        }
+        vec.resize(sz, 0u8);
+        if !data.is_null() && sz > 0 {
+            ptr::copy_nonoverlapping(data as *const u8, vec.as_mut_ptr(), sz);
+        }
+        let a = &*(this as *mut HostAttributeList);
+        let mut guard = a.inner.lock();
+        if let Some(prev) = guard.binaries.insert(attr_key(id), vec.into_boxed_slice()) {
+            // Retain replaced slice until HostAttributeList is destroyed so previously handed-out pointers stay valid
+            if guard.retired_binaries.len() < 256 {
+                guard.retired_binaries.push(prev);
+            }
+        }
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn attr_get_binary(
     this: *mut c_void,
@@ -790,20 +883,23 @@ unsafe extern "system" fn attr_get_binary(
     data: *mut *const c_void,
     size: *mut u32,
 ) -> TResult {
-    if data.is_null() || size.is_null() {
-        return K_INVALID_ARGUMENT;
-    }
-    let a = &*(this as *mut HostAttributeList);
-    let guard = a.inner.lock();
-    if let Some(boxed) = guard.binaries.get(&attr_key(id)) {
-        *data = boxed.as_ptr() as *const c_void;
-        *size = boxed.len() as u32;
-        K_RESULT_OK
-    } else {
-        *data = ptr::null();
-        *size = 0;
-        K_RESULT_FALSE
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || data.is_null() || size.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let a = &*(this as *mut HostAttributeList);
+        let guard = a.inner.lock();
+        if let Some(boxed) = guard.binaries.get(&attr_key(id)) {
+            *data = boxed.as_ptr() as *const c_void;
+            *size = boxed.len() as u32;
+            K_RESULT_OK
+        } else {
+            *data = ptr::null();
+            *size = 0;
+            K_RESULT_FALSE
+        }
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 static ATTR_LIST_VTBL: IAttributeListVtbl = IAttributeListVtbl {
@@ -844,58 +940,91 @@ struct IMessageVtbl {
 struct HostMessage {
     vtbl: *const IMessageVtbl,
     ref_count: AtomicU32,
-    msg_lock: Mutex<()>,
-    msg_id: [u8; 256],
+    msg_id_ptr: AtomicPtr<u8>,
+    /// Intentionally heap-boxed `[u8; 256]` buffers so `Vec` growth never moves or invalidates
+    /// raw `*const c_char` pointers previously returned by `IMessage::getMessageID()`.
+    #[allow(clippy::vec_box)]
+    msg_ids: Mutex<Vec<Box<[u8; 256]>>>,
     attrs: *mut HostAttributeList,
 }
 
 unsafe extern "system" fn msg_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> TResult {
-    if iid.is_null() || obj.is_null() {
-        return K_NO_INTERFACE;
-    }
-    let id = &*iid;
-    if IID_FUNKNOWN.matches(id) || IID_IMESSAGE.matches(id) {
-        msg_add_ref(this);
-        *obj = this;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || iid.is_null() || obj.is_null() {
+            return K_NO_INTERFACE;
+        }
+        let id = &*iid;
+        if IID_FUNKNOWN.matches(id) || IID_IMESSAGE.matches(id) {
+            msg_add_ref(this);
+            *obj = this;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn msg_add_ref(this: *mut c_void) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
     let m = &*(this as *mut HostMessage);
     m.ref_count.fetch_add(1, Ordering::Relaxed) + 1
 }
 unsafe extern "system" fn msg_release(this: *mut c_void) -> u32 {
-    let m = &*(this as *mut HostMessage);
-    let prev = m.ref_count.fetch_sub(1, Ordering::Release);
-    if prev == 1 {
-        std::sync::atomic::fence(Ordering::Acquire);
-        let boxed = Box::from_raw(this as *mut HostMessage);
-        if !boxed.attrs.is_null() {
-            attr_release(boxed.attrs as *mut c_void);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return 0;
         }
-        0
-    } else {
-        prev - 1
-    }
+        let m = &*(this as *mut HostMessage);
+        let prev = m.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 0 {
+            m.ref_count.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        if prev == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            let boxed = Box::from_raw(this as *mut HostMessage);
+            if !boxed.attrs.is_null() {
+                attr_release(boxed.attrs as *mut c_void);
+            }
+            0
+        } else {
+            prev - 1
+        }
+    }))
+    .unwrap_or(0)
 }
 unsafe extern "system" fn msg_get_id(this: *mut c_void) -> *const c_char {
+    if this.is_null() {
+        return b"\0".as_ptr() as *const c_char;
+    }
     let m = &*(this as *const HostMessage);
-    m.msg_id.as_ptr() as *const c_char
+    m.msg_id_ptr.load(Ordering::Acquire) as *const c_char
 }
 unsafe extern "system" fn msg_set_id(this: *mut c_void, id: *const c_char) {
-    let m = &mut *(this as *mut HostMessage);
-    let _g = m.msg_lock.lock();
-    m.msg_id.fill(0);
-    if !id.is_null() {
-        let bytes = CStr::from_ptr(id).to_bytes();
-        let n = bytes.len().min(254);
-        m.msg_id[..n].copy_from_slice(&bytes[..n]);
-        m.msg_id[n] = 0;
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return;
+        }
+        let m = &*(this as *const HostMessage);
+        let mut buf = Box::new([0u8; 256]);
+        if !id.is_null() {
+            let bytes = CStr::from_ptr(id).to_bytes();
+            let n = bytes.len().min(254);
+            buf[..n].copy_from_slice(&bytes[..n]);
+            buf[n] = 0;
+        }
+        let raw_ptr = buf.as_mut_ptr();
+        let mut ids = m.msg_ids.lock();
+        ids.push(buf);
+        m.msg_id_ptr.store(raw_ptr, Ordering::Release);
+    }));
 }
 unsafe extern "system" fn msg_get_attrs(this: *mut c_void) -> *mut c_void {
+    if this.is_null() {
+        return ptr::null_mut();
+    }
     let m = &*(this as *mut HostMessage);
     m.attrs as *mut c_void
 }
@@ -913,11 +1042,13 @@ static MESSAGE_VTBL: IMessageVtbl = IMessageVtbl {
 
 impl HostMessage {
     fn new_boxed() -> *mut HostMessage {
+        let mut init_buf = Box::new([0u8; 256]);
+        let ptr = init_buf.as_mut_ptr();
         Box::into_raw(Box::new(Self {
             vtbl: &MESSAGE_VTBL,
             ref_count: AtomicU32::new(1),
-            msg_lock: Mutex::new(()),
-            msg_id: [0u8; 256],
+            msg_id_ptr: AtomicPtr::new(ptr),
+            msg_ids: Mutex::new(vec![init_buf]),
             attrs: HostAttributeList::new_boxed(),
         }))
     }
@@ -940,27 +1071,33 @@ struct HostAppCom {
 }
 
 unsafe extern "system" fn host_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> TResult {
-    if iid.is_null() || obj.is_null() {
-        return K_NO_INTERFACE;
-    }
-    let id = &*iid;
-    if IID_FUNKNOWN.matches(id) || IID_IHOSTAPPLICATION.matches(id) {
-        *obj = this;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || iid.is_null() || obj.is_null() {
+            return K_NO_INTERFACE;
+        }
+        let id = &*iid;
+        if IID_FUNKNOWN.matches(id) || IID_IHOSTAPPLICATION.matches(id) {
+            *obj = this;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn host_get_name(_this: *mut c_void, name: *mut u16) -> TResult {
-    if !name.is_null() {
-        let s = "Rinka SoundBridge v2.0";
-        for (i, ch) in s.encode_utf16().chain(std::iter::once(0)).enumerate() {
-            if i < 127 {
-                *name.add(i) = ch;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !name.is_null() {
+            let s = "Rinka SoundBridge v2.3";
+            for (i, ch) in s.encode_utf16().chain(std::iter::once(0)).enumerate() {
+                if i < 127 {
+                    *name.add(i) = ch;
+                }
             }
         }
-    }
-    K_RESULT_OK
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn host_create_instance(
     _this: *mut c_void,
@@ -968,21 +1105,24 @@ unsafe extern "system" fn host_create_instance(
     iid: *const TUID,
     obj: *mut *mut c_void,
 ) -> TResult {
-    if obj.is_null() || cid.is_null() || iid.is_null() {
-        return K_INVALID_ARGUMENT;
-    }
-    let c = &*cid;
-    let i = &*iid;
-    if IID_IMESSAGE.matches(c) || IID_IMESSAGE.matches(i) {
-        *obj = HostMessage::new_boxed() as *mut c_void;
-        return K_RESULT_OK;
-    }
-    if IID_IATTRIBUTELIST.matches(c) || IID_IATTRIBUTELIST.matches(i) {
-        *obj = HostAttributeList::new_boxed() as *mut c_void;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if obj.is_null() || cid.is_null() || iid.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let c = &*cid;
+        let i = &*iid;
+        if IID_IMESSAGE.matches(c) || IID_IMESSAGE.matches(i) {
+            *obj = HostMessage::new_boxed() as *mut c_void;
+            return K_RESULT_OK;
+        }
+        if IID_IATTRIBUTELIST.matches(c) || IID_IATTRIBUTELIST.matches(i) {
+            *obj = HostAttributeList::new_boxed() as *mut c_void;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 static HOST_APP_VTBL: HostAppVtbl = HostAppVtbl {
@@ -1017,63 +1157,111 @@ struct ComponentHandlerVtbl {
 #[repr(C)]
 pub struct PluginComponentHandler {
     vtbl: *const ComponentHandlerVtbl,
+    pub ref_count: AtomicU32,
     pub closed: AtomicBool,
+    pub restart_flags: AtomicU32,
     pub queue: SharedParamQueue,
     pub live_params: SharedLiveParams,
     pub controller: *mut c_void,
 }
 
 unsafe extern "system" fn ch_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> TResult {
-    if iid.is_null() || obj.is_null() {
-        return K_NO_INTERFACE;
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || iid.is_null() || obj.is_null() {
+            return K_NO_INTERFACE;
+        }
+        let id = &*iid;
+        if IID_FUNKNOWN.matches(id) || IID_ICOMPONENTHANDLER.matches(id) {
+            ch_add_ref(this);
+            *obj = this;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
+}
+unsafe extern "system" fn ch_add_ref(this: *mut c_void) -> u32 {
+    if this.is_null() {
+        return 0;
     }
-    let id = &*iid;
-    if IID_FUNKNOWN.matches(id) || IID_ICOMPONENTHANDLER.matches(id) {
-        *obj = this;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    let ch = &*(this as *const PluginComponentHandler);
+    ch.ref_count.fetch_add(1, Ordering::Relaxed) + 1
+}
+unsafe extern "system" fn ch_release(this: *mut c_void) -> u32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return 0;
+        }
+        let ch = &*(this as *const PluginComponentHandler);
+        let prev = ch.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 0 {
+            ch.ref_count.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        if prev == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            let _ = Box::from_raw(this as *mut PluginComponentHandler);
+            0
+        } else {
+            prev - 1
+        }
+    }))
+    .unwrap_or(0)
 }
 unsafe extern "system" fn ch_begin(_this: *mut c_void, _id: u32) -> TResult {
     K_RESULT_OK
 }
 unsafe extern "system" fn ch_perform(this: *mut c_void, id: u32, value_normalized: f64) -> TResult {
-    if this.is_null() {
-        return K_RESULT_OK;
-    }
-    let ch = &*(this as *mut PluginComponentHandler);
-    if ch.closed.load(Ordering::Relaxed) {
-        return K_RESULT_OK;
-    }
-    if value_normalized.is_finite() {
-        let clamped = value_normalized.clamp(0.0, 1.0);
-        {
-            let mut q = ch.queue.lock();
-            if let Some(existing) = q.iter_mut().find(|(pid, _)| *pid == id) {
-                existing.1 = clamped;
-            } else if q.len() < 512 {
-                q.push((id, clamped));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return K_RESULT_OK;
+        }
+        let ch = &*(this as *mut PluginComponentHandler);
+        if ch.closed.load(Ordering::Relaxed) {
+            return K_RESULT_OK;
+        }
+        if value_normalized.is_finite() {
+            let clamped = value_normalized.clamp(0.0, 1.0);
+            {
+                let mut q = ch.queue.lock();
+                if let Some(existing) = q.iter_mut().find(|(pid, _)| *pid == id) {
+                    existing.1 = clamped;
+                } else if q.len() < 512 {
+                    q.push((id, clamped));
+                }
+            }
+            if let Some(mut lp) = ch.live_params.try_lock() {
+                lp.insert(id, clamped);
             }
         }
-        if let Some(mut lp) = ch.live_params.try_lock() {
-            lp.insert(id, clamped);
-        }
-    }
-    K_RESULT_OK
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn ch_end(_this: *mut c_void, _id: u32) -> TResult {
     K_RESULT_OK
 }
-unsafe extern "system" fn ch_restart(_this: *mut c_void, _flags: i32) -> TResult {
-    K_RESULT_OK
+unsafe extern "system" fn ch_restart(this: *mut c_void, flags: i32) -> TResult {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return K_RESULT_OK;
+        }
+        let ch = &*(this as *mut PluginComponentHandler);
+        if !ch.closed.load(Ordering::Relaxed) {
+            let f_u32 = if flags == 0 { 4u32 } else { flags as u32 };
+            ch.restart_flags.fetch_or(f_u32, Ordering::Release);
+        }
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 static COMP_HANDLER_VTBL: ComponentHandlerVtbl = ComponentHandlerVtbl {
     unknown: FUnknownVtbl {
         query_interface: ch_qi,
-        add_ref: noop_add_ref,
-        release: noop_release,
+        add_ref: ch_add_ref,
+        release: ch_release,
     },
     begin_edit: ch_begin,
     perform_edit: ch_perform,
@@ -1102,18 +1290,24 @@ pub struct HostParamValueQueue {
 }
 
 unsafe extern "system" fn pvq_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> TResult {
-    if iid.is_null() || obj.is_null() {
-        return K_NO_INTERFACE;
-    }
-    let id = &*iid;
-    if IID_FUNKNOWN.matches(id) || IID_IPARAMVALUEQUEUE.matches(id) {
-        *obj = this;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || iid.is_null() || obj.is_null() {
+            return K_NO_INTERFACE;
+        }
+        let id = &*iid;
+        if IID_FUNKNOWN.matches(id) || IID_IPARAMVALUEQUEUE.matches(id) {
+            *obj = this;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn pvq_get_id(this: *mut c_void) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
     (*(this as *const HostParamValueQueue)).param_id
 }
 unsafe extern "system" fn pvq_get_count(_this: *mut c_void) -> i32 {
@@ -1125,17 +1319,20 @@ unsafe extern "system" fn pvq_get_point(
     sample_offset: *mut i32,
     value: *mut f64,
 ) -> TResult {
-    if index != 0 {
-        return K_INVALID_ARGUMENT;
-    }
-    let q = &*(this as *const HostParamValueQueue);
-    if !sample_offset.is_null() {
-        *sample_offset = 0;
-    }
-    if !value.is_null() {
-        *value = q.value;
-    }
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || index != 0 {
+            return K_INVALID_ARGUMENT;
+        }
+        let q = &*(this as *const HostParamValueQueue);
+        if !sample_offset.is_null() {
+            *sample_offset = 0;
+        }
+        if !value.is_null() {
+            *value = q.value;
+        }
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn pvq_add_point(
     this: *mut c_void,
@@ -1143,12 +1340,18 @@ unsafe extern "system" fn pvq_add_point(
     value: f64,
     index: *mut i32,
 ) -> TResult {
-    let q = &mut *(this as *mut HostParamValueQueue);
-    q.value = value;
-    if !index.is_null() {
-        *index = 0;
-    }
-    K_RESULT_OK
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return K_INVALID_ARGUMENT;
+        }
+        let q = &mut *(this as *mut HostParamValueQueue);
+        q.value = value;
+        if !index.is_null() {
+            *index = 0;
+        }
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 static PVQ_VTBL: IParamValueQueueVtbl = IParamValueQueueVtbl {
@@ -1182,59 +1385,74 @@ pub struct HostParameterChanges {
 }
 
 unsafe extern "system" fn pc_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> TResult {
-    if iid.is_null() || obj.is_null() {
-        return K_NO_INTERFACE;
-    }
-    let id = &*iid;
-    if IID_FUNKNOWN.matches(id) || IID_IPARAMETERCHANGES.matches(id) {
-        *obj = this;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || iid.is_null() || obj.is_null() {
+            return K_NO_INTERFACE;
+        }
+        let id = &*iid;
+        if IID_FUNKNOWN.matches(id) || IID_IPARAMETERCHANGES.matches(id) {
+            *obj = this;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 unsafe extern "system" fn pc_get_count(this: *mut c_void) -> i32 {
+    if this.is_null() {
+        return 0;
+    }
     (*(this as *const HostParameterChanges)).len as i32
 }
 unsafe extern "system" fn pc_get_data(this: *mut c_void, index: i32) -> *mut c_void {
-    let pc = &mut *(this as *mut HostParameterChanges);
-    if index >= 0 && (index as usize) < pc.len {
-        &mut pc.queues[index as usize] as *mut HostParamValueQueue as *mut c_void
-    } else {
-        ptr::null_mut()
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return ptr::null_mut();
+        }
+        let pc = &mut *(this as *mut HostParameterChanges);
+        if index >= 0 && (index as usize) < pc.len {
+            &mut pc.queues[index as usize] as *mut HostParamValueQueue as *mut c_void
+        } else {
+            ptr::null_mut()
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 unsafe extern "system" fn pc_add_data(
     this: *mut c_void,
     id: *const u32,
     index: *mut i32,
 ) -> *mut c_void {
-    if id.is_null() {
-        return ptr::null_mut();
-    }
-    let pid = *id;
-    let pc = &mut *(this as *mut HostParameterChanges);
-    let idx = if let Some(pos) = pc.queues[..pc.len].iter().position(|q| q.param_id == pid) {
-        pos
-    } else if pc.len < MAX_PARAM_QUEUES {
-        let pos = pc.len;
-        pc.queues[pos] = HostParamValueQueue {
-            vtbl: &PVQ_VTBL,
-            param_id: pid,
-            value: 0.0,
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || id.is_null() {
+            return ptr::null_mut();
+        }
+        let pid = *id;
+        let pc = &mut *(this as *mut HostParameterChanges);
+        let idx = if let Some(pos) = pc.queues[..pc.len].iter().position(|q| q.param_id == pid) {
+            pos
+        } else if pc.len < MAX_PARAM_QUEUES {
+            let pos = pc.len;
+            pc.queues[pos] = HostParamValueQueue {
+                vtbl: &PVQ_VTBL,
+                param_id: pid,
+                value: 0.0,
+            };
+            pc.len += 1;
+            pos
+        } else {
+            let pos = MAX_PARAM_QUEUES - 1;
+            pc.queues[pos].param_id = pid;
+            pc.queues[pos].value = 0.0;
+            pos
         };
-        pc.len += 1;
-        pos
-    } else {
-        let pos = MAX_PARAM_QUEUES - 1;
-        pc.queues[pos].param_id = pid;
-        pc.queues[pos].value = 0.0;
-        pos
-    };
-    if !index.is_null() {
-        *index = idx as i32;
-    }
-    &mut pc.queues[idx] as *mut HostParamValueQueue as *mut c_void
+        if !index.is_null() {
+            *index = idx as i32;
+        }
+        &mut pc.queues[idx] as *mut HostParamValueQueue as *mut c_void
+    }))
+    .unwrap_or(ptr::null_mut())
 }
 
 static PARAM_CHANGES_VTBL: IParameterChangesVtbl = IParameterChangesVtbl {
@@ -1297,34 +1515,50 @@ pub struct HostPlugFrame {
 }
 
 unsafe extern "system" fn pf_qi(this: *mut c_void, iid: *const TUID, obj: *mut *mut c_void) -> TResult {
-    if iid.is_null() || obj.is_null() {
-        return K_NO_INTERFACE;
-    }
-    let id = &*iid;
-    if IID_FUNKNOWN.matches(id) || IID_IPLUGFRAME.matches(id) {
-        pf_add_ref(this);
-        *obj = this;
-        return K_RESULT_OK;
-    }
-    *obj = ptr::null_mut();
-    K_NO_INTERFACE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || iid.is_null() || obj.is_null() {
+            return K_NO_INTERFACE;
+        }
+        let id = &*iid;
+        if IID_FUNKNOWN.matches(id) || IID_IPLUGFRAME.matches(id) {
+            pf_add_ref(this);
+            *obj = this;
+            return K_RESULT_OK;
+        }
+        *obj = ptr::null_mut();
+        K_NO_INTERFACE
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 unsafe extern "system" fn pf_add_ref(this: *mut c_void) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
     let pf = &*(this as *mut HostPlugFrame);
     pf.ref_count.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 unsafe extern "system" fn pf_release(this: *mut c_void) -> u32 {
-    let pf = &*(this as *mut HostPlugFrame);
-    let prev = pf.ref_count.fetch_sub(1, Ordering::Release);
-    if prev == 1 {
-        std::sync::atomic::fence(Ordering::Acquire);
-        let _ = Box::from_raw(this as *mut HostPlugFrame);
-        0
-    } else {
-        prev - 1
-    }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() {
+            return 0;
+        }
+        let pf = &*(this as *mut HostPlugFrame);
+        let prev = pf.ref_count.fetch_sub(1, Ordering::Release);
+        if prev == 0 {
+            pf.ref_count.store(0, Ordering::Relaxed);
+            return 0;
+        }
+        if prev == 1 {
+            std::sync::atomic::fence(Ordering::Acquire);
+            let _ = Box::from_raw(this as *mut HostPlugFrame);
+            0
+        } else {
+            prev - 1
+        }
+    }))
+    .unwrap_or(0)
 }
 
 unsafe extern "system" fn pf_resize_view(
@@ -1332,44 +1566,47 @@ unsafe extern "system" fn pf_resize_view(
     view: *mut c_void,
     new_size: *mut ViewRect,
 ) -> TResult {
-    if view.is_null() || new_size.is_null() {
-        return K_INVALID_ARGUMENT;
-    }
-    let pf = &*(this as *const HostPlugFrame);
-    if pf.hwnd == 0 {
-        return K_RESULT_FALSE;
-    }
-    // Cegah rekursi tak terbatas jika plugin memanggil resizeView lagi di dalam onSize()
-    if pf.in_resize.swap(true, Ordering::SeqCst) {
-        return K_RESULT_OK;
-    }
-    let r = *new_size;
-    let client_w = (r.right - r.left).max(200);
-    let client_h = (r.bottom - r.top).max(120);
-
-    #[cfg(windows)]
-    {
-        use crate::win32::ffi;
-        if pf.hwnd != 0 {
-            let mut wr = ffi::RECT::default();
-            ffi::GetWindowRect(pf.hwnd, &mut wr);
-            ffi::SetWindowPos(
-                pf.hwnd,
-                0,
-                wr.left,
-                wr.top,
-                client_w + 16,
-                client_h + 39,
-                0x0004 | 0x0020 | 0x0010, // SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE
-            );
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if this.is_null() || view.is_null() || new_size.is_null() {
+            return K_INVALID_ARGUMENT;
         }
-    }
+        let pf = &*(this as *const HostPlugFrame);
+        if pf.hwnd == 0 {
+            return K_RESULT_FALSE;
+        }
+        // Cegah rekursi tak terbatas jika plugin memanggil resizeView lagi di dalam onSize()
+        if pf.in_resize.swap(true, Ordering::SeqCst) {
+            return K_RESULT_OK;
+        }
+        let r = *new_size;
+        let client_w = (r.right - r.left).max(200);
+        let client_h = (r.bottom - r.top).max(120);
 
-    let v_vtbl = &**(view as *mut *const IPlugViewVtbl);
-    let mut nr = r;
-    let _ = (v_vtbl.on_size)(view, &mut nr);
-    pf.in_resize.store(false, Ordering::SeqCst);
-    K_RESULT_OK
+        #[cfg(windows)]
+        {
+            use crate::win32::ffi;
+            if pf.hwnd != 0 {
+                let mut wr = ffi::RECT::default();
+                ffi::GetWindowRect(pf.hwnd, &mut wr);
+                ffi::SetWindowPos(
+                    pf.hwnd,
+                    0,
+                    wr.left,
+                    wr.top,
+                    client_w + 16,
+                    client_h + 39,
+                    0x0004 | 0x0020 | 0x0010, // SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE
+                );
+            }
+        }
+
+        let v_vtbl = &**(view as *mut *const IPlugViewVtbl);
+        let mut nr = r;
+        let _ = (v_vtbl.on_size)(view, &mut nr);
+        pf.in_resize.store(false, Ordering::SeqCst);
+        K_RESULT_OK
+    }))
+    .unwrap_or(K_INTERNAL_ERROR)
 }
 
 static PLUG_FRAME_VTBL: IPlugFrameVtbl = IPlugFrameVtbl {
@@ -1547,6 +1784,7 @@ impl VstAudioProcessor {
 
     /// Reset ringan tanpa memanggil `IComponent::setActive(0)` di thread audio!
     pub fn reset(&mut self) {
+        self.sample_counter = 0;
         for b in &mut self.in_ch_bufs {
             b.fill(0.0);
         }
@@ -1557,7 +1795,29 @@ impl VstAudioProcessor {
         self.dummy_out_buf.fill(0.0);
     }
 
+    /// Sinkronkan `IAudioProcessor::setProcessing(1/0)` dari main/UI thread di bawah lock `audio_proc`
+    /// saat slot masuk/keluar mode Bypass sehingga worker/GPU internal plugin dapat berhenti idle.
+    pub fn set_processing_state(&mut self, active: bool) {
+        if self.processor.is_null() || self.is_processing == active {
+            return;
+        }
+        unsafe {
+            let p_vtbl = &**(self.processor as *mut *const IAudioProcessorVtbl);
+            let proc_ptr = self.processor;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = (p_vtbl.set_processing)(proc_ptr, if active { 1 } else { 0 });
+            }));
+        }
+        self.is_processing = active;
+        if active {
+            self.reset();
+        }
+    }
+
     pub fn process_stereo(&mut self, left: &mut [f32], right: &mut [f32], sample_rate: u32) -> Result<(), String> {
+        if !self.is_processing {
+            return Ok(());
+        }
         let frames = left.len().min(right.len());
         if frames == 0 {
             return Ok(());
@@ -1634,11 +1894,28 @@ impl VstAudioProcessor {
             channel_buffers_32: main_out_ptrs.as_mut_ptr(),
         };
 
-        // kPlaying (1<<1) | kTempoValid (1<<10) | kTimeSigValid (1<<13) | kContTimeValid (1<<15)
+        // Wrap `project_time_samples` cleanly at bar-aligned 4,608,000-sample (96s @ 48kHz = 48 bars @ 120 BPM)
+        // boundaries during silent passages so VST3 plugins that cast `project_time_samples as f32` internally
+        // NEVER exceed 2^23 (8.38M samples = ~3 minutes) or degrade after >10 minutes of streaming!
+        let mut is_silent_in = true;
+        for i in (0..frames).step_by(4) {
+            if left[i].abs() > 1.5e-4 || right[i].abs() > 1.5e-4 {
+                is_silent_in = false;
+                break;
+            }
+        }
+        if is_silent_in && self.sample_counter >= 4_608_000 {
+            self.sample_counter %= 192_000;
+        }
+        let sr_f = (sample_rate.max(44100)) as f64;
+        let beats = (self.sample_counter as f64 / sr_f) * 2.0; // 120 BPM = 2.0 quarter-note beats/sec
+        // kPlaying (1<<1) | kProjectTimeMusicValid (1<<9) | kTempoValid (1<<10) | kTimeSigValid (1<<13) | kContTimeValid (1<<15)
         let mut ctx = ProcessContext {
-            state: (1 << 1) | (1 << 10) | (1 << 13) | (1 << 15),
-            sample_rate: sample_rate as f64,
+            state: (1 << 1) | (1 << 9) | (1 << 10) | (1 << 13) | (1 << 15),
+            sample_rate: sr_f,
             project_time_samples: self.sample_counter,
+            project_time_music: beats,
+            bar_position_music: (beats / 4.0).floor() * 4.0,
             continous_time_samples: self.sample_counter,
             tempo: 120.0,
             time_sig_numerator: 4,
@@ -1668,6 +1945,7 @@ impl VstAudioProcessor {
             if res != K_RESULT_OK && res != K_RESULT_FALSE {
                 return Err(format!("IAudioProcessor::process failed (code {})", res));
             }
+            self.latency_samples = (p_vtbl.get_latency_samples)(self.processor);
         }
 
         // 4. Validasi NaN/Inf & flush subnormal terlebih dahulu pada `out_ch_bufs` sebelum menyalin ke `left`/`right`.
@@ -2045,35 +2323,112 @@ impl VstController {
         Err("VST3 HWND GUI Editor is only available on Windows".into())
     }
 
-    pub fn hide_editor_window(&mut self) {
-        if let Some(ref mut ed) = self.active_editor {
-            #[cfg(windows)]
+    /// Lepaskan `IPlugView` (`removed()` -> `set_frame(null)` -> `release()`) dan hancurkan HWND host-nya
+    /// secara penuh di luar wndproc sambil menjaga konteks OpenGL `eframe` tetap utuh.
+    pub fn close_and_detach_editor(&mut self) -> bool {
+        let Some(ed) = self.active_editor.take() else {
+            return false;
+        };
+        #[cfg(windows)]
+        {
+            let _gl_guard = OpenGlContextGuard::save();
             unsafe {
-                let _gl_guard = OpenGlContextGuard::save();
+                if !ed.plug_frame.is_null() {
+                    (*ed.plug_frame).hwnd = 0;
+                }
                 if ed.hwnd != 0 {
                     crate::win32::ffi::ShowWindow(ed.hwnd, crate::win32::ffi::SW_HIDE);
                 }
-                ed.was_visible = false;
+                let view_ptr = ed.view;
+                let frame_ptr = ed.plug_frame;
+                let hwnd = ed.hwnd;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if !view_ptr.is_null() {
+                        let v_vtbl = &**(view_ptr as *mut *const IPlugViewVtbl);
+                        let _ = (v_vtbl.removed)(view_ptr);
+                        let _ = (v_vtbl.set_frame)(view_ptr, ptr::null_mut());
+                        (v_vtbl.unknown.release)(view_ptr);
+                    }
+                    if !frame_ptr.is_null() {
+                        pf_release(frame_ptr as *mut c_void);
+                    }
+                    if hwnd != 0 {
+                        let _ = crate::win32::ffi::DestroyWindow(hwnd);
+                    }
+                }));
             }
             restore_host_gl_context();
+            reassert_crash_handlers();
+            trim_process_working_set();
+            record_breadcrumb("Editor GUI VST dilepas bersih (IPlugView::removed + DestroyWindow)");
         }
+        #[cfg(not(windows))]
+        let _ = ed;
+        true
     }
 
-    pub fn poll_editor_closed(&mut self) -> bool {
-        let Some(ref mut ed) = self.active_editor else {
+    pub fn is_editor_pending_close(&self) -> bool {
+        let Some(ref ed) = self.active_editor else {
             return false;
         };
         #[cfg(windows)]
         unsafe {
-            let visible = crate::win32::ffi::IsWindowVisible(ed.hwnd) != 0;
-            if !visible && ed.was_visible {
-                ed.was_visible = false;
-                record_breadcrumb("Jendela GUI Editor VST ditutup (SW_HIDE)");
-                restore_host_gl_context();
-                return true;
-            }
+            ed.was_visible && crate::win32::ffi::IsWindowVisible(ed.hwnd) == 0
         }
-        false
+        #[cfg(not(windows))]
+        {
+            let _ = ed;
+            false
+        }
+    }
+
+    pub fn hide_editor_window(&mut self) {
+        let _ = self.close_and_detach_editor();
+    }
+
+    /// Sinkronkan seluruh parameter dari `IEditController` ke `live_params` dan `param_queue`
+    /// ketika plugin memanggil `IComponentHandler::restartComponent` (mis. saat memilih preset di FabFilter Pro-R / Pro-Q 3).
+    pub fn poll_component_restart(&mut self) -> bool {
+        if self.handler_box.is_null() || self.controller.is_null() {
+            return false;
+        }
+        unsafe {
+            let flags = (*self.handler_box).restart_flags.swap(0, Ordering::AcqRel);
+            if flags == 0 {
+                return false;
+            }
+            let ctrl_vtbl = &**(self.controller as *mut *const IEditControllerVtbl);
+            let p_count = (ctrl_vtbl.get_parameter_count)(self.controller);
+            let mut lp = self.live_params.lock();
+            let mut q = self.param_queue.lock();
+            for idx in 0..p_count {
+                let mut pinfo: ParameterInfo = std::mem::zeroed();
+                if (ctrl_vtbl.get_parameter_info)(self.controller, idx, &mut pinfo) == K_RESULT_OK {
+                    let val = (ctrl_vtbl.get_param_normalized)(self.controller, pinfo.id);
+                    if val.is_finite() {
+                        let clamped = val.clamp(0.0, 1.0);
+                        let changed = lp.insert(pinfo.id, clamped).map(|old| (old - clamped).abs() > 1e-7).unwrap_or(true);
+                        if changed {
+                            if let Some(existing) = q.iter_mut().find(|(pid, _)| *pid == pinfo.id) {
+                                existing.1 = clamped;
+                            } else if q.len() < MAX_PARAM_QUEUES {
+                                q.push((pinfo.id, clamped));
+                            }
+                        }
+                    }
+                }
+            }
+            true
+        }
+    }
+
+    pub fn poll_editor_closed(&mut self) -> bool {
+        let restarted = self.poll_component_restart();
+        if self.is_editor_pending_close() {
+            let _ = self.close_and_detach_editor();
+            return true;
+        }
+        restarted
     }
 }
 
@@ -2085,11 +2440,14 @@ unsafe extern "system" fn vst_editor_wndproc(
     lparam: crate::win32::ffi::LPARAM,
 ) -> crate::win32::ffi::LRESULT {
     use crate::win32::ffi;
-    if msg == ffi::WM_CLOSE {
-        ffi::ShowWindow(hwnd, ffi::SW_HIDE);
-        return 0;
-    }
-    ffi::DefWindowProcW(hwnd, msg, wparam, lparam)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if msg == ffi::WM_CLOSE {
+            ffi::ShowWindow(hwnd, ffi::SW_HIDE);
+            return 0;
+        }
+        ffi::DefWindowProcW(hwnd, msg, wparam, lparam)
+    }))
+    .unwrap_or_else(|_| ffi::DefWindowProcW(hwnd, msg, wparam, lparam))
 }
 
 // ==============================================================================
@@ -2196,7 +2554,9 @@ pub fn load_vst3_pair(
         let live_params: SharedLiveParams = Arc::new(Mutex::new(HashMap::with_capacity(64)));
         let handler_box = Box::into_raw(Box::new(PluginComponentHandler {
             vtbl: &COMP_HANDLER_VTBL,
+            ref_count: AtomicU32::new(1),
             closed: AtomicBool::new(false),
+            restart_flags: AtomicU32::new(0),
             queue: Arc::clone(&param_queue),
             live_params: Arc::clone(&live_params),
             controller,
@@ -2326,8 +2686,11 @@ pub struct VSTSlot {
     pub reset_pending: AtomicBool,
     pub flush_pending: AtomicBool,
     pub error_count: AtomicU32,
+    pub rt_error_code: AtomicU8, // 0=none, 1=process_error, 2=internal_panic
+    pub rt_error_pending_log: AtomicBool,
     pub last_error_message: Mutex<Option<String>>,
     pub last_error_time_ms: AtomicU64,
+    pub rt_error_elapsed_ms: AtomicU64,
     pub cached_params: Mutex<HashMap<String, f64>>,
     pub cached_comp_state: Mutex<Option<String>>,
     pub cached_ctrl_state: Mutex<Option<String>>,
@@ -2366,8 +2729,11 @@ impl VSTSlot {
             reset_pending: AtomicBool::new(false),
             flush_pending: AtomicBool::new(false),
             error_count: AtomicU32::new(0),
+            rt_error_code: AtomicU8::new(0),
+            rt_error_pending_log: AtomicBool::new(false),
             last_error_message: Mutex::new(None),
             last_error_time_ms: AtomicU64::new(0),
+            rt_error_elapsed_ms: AtomicU64::new(0),
             cached_params: Mutex::new(cached),
             cached_comp_state: Mutex::new(None),
             cached_ctrl_state: Mutex::new(None),
@@ -2389,9 +2755,33 @@ impl VSTSlot {
             self.name,
             if val { "BYPASS (Nonaktif)" } else { "ON (Aktif)" }
         ));
-        self.bypassed.store(val, Ordering::Relaxed);
-        if !val {
-            self.flush_pending.store(true, Ordering::Relaxed);
+        if val {
+            self.bypassed.store(true, Ordering::Release);
+            let mut guard = self.audio_proc.lock();
+            if let Some(ref mut proc) = *guard {
+                proc.set_processing_state(false);
+            }
+        } else {
+            {
+                let mut guard = self.audio_proc.lock();
+                if let Some(ref mut proc) = *guard {
+                    proc.set_processing_state(true);
+                }
+            }
+            self.flush_pending.store(true, Ordering::Release);
+            self.bypassed.store(false, Ordering::Release);
+        }
+    }
+
+    /// Lock-free, zero-allocation error recorder safe for real-time audio callbacks.
+    /// UI thread flushes the diagnostic log via `has_recent_error()` / `flush_rt_error_log()`.
+    #[inline]
+    pub fn record_error_rt(&self, is_panic: bool, elapsed_ms: u64) {
+        self.error_count.fetch_add(1, Ordering::Relaxed);
+        self.rt_error_code.store(if is_panic { 2 } else { 1 }, Ordering::Release);
+        self.rt_error_elapsed_ms.store(elapsed_ms, Ordering::Relaxed);
+        if self.rt_error_pending_log.swap(true, Ordering::AcqRel) {
+            self.suppressed_logs.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2405,7 +2795,51 @@ impl VSTSlot {
         self.last_error_time_ms.store(now_ms, Ordering::Relaxed);
     }
 
+    /// Flushes any deferred RT VST error log on the UI thread (rate-limited to once per 2s).
+    pub fn flush_rt_error_log(&self, line_name: &str) {
+        if !self.rt_error_pending_log.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Instant::now();
+        let mut last_guard = self.last_logged_time.lock();
+        let should_log = match *last_guard {
+            None => true,
+            Some(prev) => now.saturating_duration_since(prev).as_secs_f64() >= 2.0,
+        };
+        if !should_log {
+            return;
+        }
+        if !self.rt_error_pending_log.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        *last_guard = Some(now);
+        let suppressed = self.suppressed_logs.swap(0, Ordering::Relaxed);
+        let count = self.error_count.load(Ordering::Relaxed);
+        let code = self.rt_error_code.load(Ordering::Acquire);
+        let msg = if code == 2 {
+            "VST plugin encountered an internal panic"
+        } else {
+            "VST plugin process() returned error"
+        };
+        *self.last_error_message.lock() = Some(msg.to_string());
+        let now_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_error_time_ms.store(now_epoch, Ordering::Relaxed);
+        let extra = if suppressed > 0 {
+            format!(" (+{} error disembunyikan)", suppressed)
+        } else {
+            String::new()
+        };
+        log_error(format!(
+            "[{}] VST '{}' gagal diproses (ke-{}x): {}{}",
+            line_name, self.name, count, msg, extra
+        ));
+    }
+
     pub fn has_recent_error(&self, timeout_sec: f64) -> Option<(u32, String)> {
+        self.flush_rt_error_log("VST");
         let count = self.error_count.load(Ordering::Relaxed);
         if count == 0 {
             return None;
@@ -2428,6 +2862,9 @@ impl VSTSlot {
     }
 
     pub fn sync_cached_params(&self) {
+        // Kunci konsisten: `audio_proc` terlebih dahulu baru `gui_ctrl` (sama dengan `shutdown_and_release`)
+        // agar `IComponent::getState` tidak pernah berlomba dengan `IAudioProcessor::process` di RT thread!
+        let _audio_guard = self.audio_proc.lock();
         if let Some(ref ctrl) = *self.gui_ctrl.lock() {
             *self.cached_params.lock() = ctrl.capture_parameters();
             let (comp_hex, ctrl_hex) = ctrl.capture_binary_states();
@@ -2446,8 +2883,9 @@ impl VSTSlot {
         comp_hex: Option<&str>,
         ctrl_hex: Option<&str>,
     ) {
-        // JANGAN mengunci `self.audio_proc.lock()` dari thread UI agar callback real-time audio
-        // tidak pernah gagal `try_lock()` dan melewatkan pemrosesan VST!
+        // Kunci konsisten: `audio_proc` -> `gui_ctrl` sehingga `IComponent::setState` tidak pernah
+        // dijalankan serentak dengan `IAudioProcessor::process` (mematuhi thread-safety spec VST3).
+        let _audio_guard = self.audio_proc.lock();
         if let Some(ref ctrl) = *self.gui_ctrl.lock() {
             ctrl.restore_binary_states(comp_hex, ctrl_hex);
             if !params.is_empty() {
@@ -2482,18 +2920,31 @@ impl VSTSlot {
     }
 
     pub fn poll_editor_closed(&self) -> bool {
-        let closed = {
+        let (restarted, pending_close) = {
             let mut guard = self.gui_ctrl.lock();
             if let Some(ref mut ctrl) = *guard {
-                ctrl.poll_editor_closed()
+                let r = ctrl.poll_component_restart();
+                let p = ctrl.is_editor_pending_close();
+                (r, p)
             } else {
-                false
+                (false, false)
             }
         };
-        if closed {
+        if pending_close {
+            // Kunci konsisten: `sync_cached_params()` mengunci `audio_proc` -> `gui_ctrl`
+            // sebelum editor dilepas agar parameter/binary state terbaru tetap tersimpan.
             self.sync_cached_params();
+            let mut guard = self.gui_ctrl.lock();
+            if let Some(ref mut ctrl) = *guard {
+                let _ = ctrl.close_and_detach_editor();
+            }
+            return true;
         }
-        closed
+        if restarted {
+            self.sync_cached_params();
+            return true;
+        }
+        false
     }
 
     pub fn shutdown_and_release(&self) {
@@ -2507,35 +2958,29 @@ impl VSTSlot {
         record_breadcrumb(format!("Melepas instance VST '{}'", self.name));
         let _gl_guard = OpenGlContextGuard::save();
 
-        unsafe {
-            // 1. Jika ada jendela editor GUI, sembunyikan terlebih dahulu & matikan callback resize
-            let mut had_active_editor = false;
-            if let Some(ref mut ctrl) = ctrl_opt {
-                if let Some(ed) = ctrl.active_editor.take() {
-                    had_active_editor = true;
-                    if !ed.plug_frame.is_null() {
-                        (*ed.plug_frame).hwnd = 0;
-                    }
-                    #[cfg(windows)]
-                    if ed.hwnd != 0 {
-                        crate::win32::ffi::ShowWindow(ed.hwnd, crate::win32::ffi::SW_HIDE);
-                    }
-                    // Parkir pointer view & hwnd yang sudah tersembunyi agar tidak memicu crash OpenGL/baseview di tengah sesi
-                    let retired = RETIRED_VST_EDITORS.get_or_init(|| Mutex::new(Vec::new()));
-                    retired.lock().push((ed.view as usize, ed.plug_frame as usize, ed.hwnd as usize));
-                }
-            }
+        // 1. Lepaskan jendela editor GUI VST3 (IPlugView::removed + set_frame(null) + DestroyWindow)
+        //    terlebih dahulu agar context OpenGL/D3D & worker UI berhenti sebelum COM terminate().
+        if let Some(ref mut ctrl) = ctrl_opt {
+            let _ = ctrl.close_and_detach_editor();
+        }
 
+        unsafe {
             // 2. Hentikan pemrosesan audio (`setProcessing(0)` lalu `setActive(0)`) SELAGI `_lib` & `ctrl` MASIH HIDUP!
             if let Some(ref proc) = proc_opt {
-                if !proc.processor.is_null() && proc.is_processing {
-                    let p_vtbl = &**(proc.processor as *mut *const IAudioProcessorVtbl);
-                    let _ = (p_vtbl.set_processing)(proc.processor, 0);
-                }
-                if !proc.component.is_null() && proc.is_active {
-                    let c_vtbl = &**(proc.component as *mut *const IComponentVtbl);
-                    let _ = (c_vtbl.set_active)(proc.component, 0);
-                }
+                let proc_ptr = proc.processor;
+                let comp_ptr = proc.component;
+                let is_proc = proc.is_processing;
+                let is_act = proc.is_active;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if !proc_ptr.is_null() && is_proc {
+                        let p_vtbl = &**(proc_ptr as *mut *const IAudioProcessorVtbl);
+                        let _ = (p_vtbl.set_processing)(proc_ptr, 0);
+                    }
+                    if !comp_ptr.is_null() && is_act {
+                        let c_vtbl = &**(comp_ptr as *mut *const IComponentVtbl);
+                        let _ = (c_vtbl.set_active)(comp_ptr, 0);
+                    }
+                }));
             }
 
             // 3. Putuskan hubungan IComponentHandler & IConnectionPoint
@@ -2565,36 +3010,47 @@ impl VSTSlot {
                 }
             }
 
-            // 4. Jika tidak ada jendela OpenGL aktif yang diparkir, lepaskan interface COM secara berurutan
-            if !had_active_editor {
-                if let Some(ref proc) = proc_opt {
-                    if !proc.processor.is_null() {
-                        let p_vtbl = &**(proc.processor as *mut *const IAudioProcessorVtbl);
-                        (p_vtbl.unknown.release)(proc.processor);
+            // 4. Selalu lepaskan interface COM secara berurutan agar worker thread & context GPU/DirectML plugin ikut bebas!
+            if let Some(ref proc) = proc_opt {
+                let proc_ptr = proc.processor;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if !proc_ptr.is_null() {
+                        let p_vtbl = &**(proc_ptr as *mut *const IAudioProcessorVtbl);
+                        (p_vtbl.unknown.release)(proc_ptr);
                     }
-                }
-                if let Some(ref mut ctrl) = ctrl_opt {
-                    if !ctrl.controller.is_null() {
-                        let ctrl_vtbl = &**(ctrl.controller as *mut *const IEditControllerVtbl);
-                        if ctrl.separate_controller {
-                            let _ = (ctrl_vtbl.base.terminate)(ctrl.controller);
+                }));
+            }
+            if let Some(ref mut ctrl) = ctrl_opt {
+                let ctrl_ptr = ctrl.controller;
+                let sep_ctrl = ctrl.separate_controller;
+                ctrl.controller = ptr::null_mut();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if !ctrl_ptr.is_null() {
+                        let ctrl_vtbl = &**(ctrl_ptr as *mut *const IEditControllerVtbl);
+                        if sep_ctrl {
+                            let _ = (ctrl_vtbl.base.terminate)(ctrl_ptr);
                         }
-                        (ctrl_vtbl.base.unknown.release)(ctrl.controller);
-                        ctrl.controller = ptr::null_mut();
+                        (ctrl_vtbl.base.unknown.release)(ctrl_ptr);
                     }
-                }
-                if let Some(ref proc) = proc_opt {
-                    if !proc.component.is_null() {
-                        let c_vtbl = &**(proc.component as *mut *const IComponentVtbl);
-                        let _ = (c_vtbl.base.terminate)(proc.component);
-                        (c_vtbl.base.unknown.release)(proc.component);
+                }));
+            }
+            if let Some(ref proc) = proc_opt {
+                let comp_ptr = proc.component;
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if !comp_ptr.is_null() {
+                        let c_vtbl = &**(comp_ptr as *mut *const IComponentVtbl);
+                        let _ = (c_vtbl.base.terminate)(comp_ptr);
+                        (c_vtbl.base.unknown.release)(comp_ptr);
                     }
-                }
-                if let Some(ref mut ctrl) = ctrl_opt {
-                    if !ctrl.handler_box.is_null() {
-                        let _ = Box::from_raw(ctrl.handler_box);
-                        ctrl.handler_box = ptr::null_mut();
-                    }
+                }));
+            }
+            if let Some(ref mut ctrl) = ctrl_opt {
+                let hb = ctrl.handler_box;
+                ctrl.handler_box = ptr::null_mut();
+                if !hb.is_null() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        ch_release(hb as *mut c_void);
+                    }));
                 }
             }
         }
@@ -2606,5 +3062,135 @@ impl VSTSlot {
 impl Drop for VSTSlot {
     fn drop(&mut self) {
         self.shutdown_and_release();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    #[test]
+    fn test_memory_bstream_bounds_and_overflow_rejection() {
+        let mut bs = MemoryBStream::new();
+        let this = &mut bs as *mut MemoryBStream as *mut c_void;
+
+        // Normal write & read roundtrip
+        let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut written = 0i32;
+        unsafe {
+            assert_eq!(
+                bstream_write(this, payload.as_ptr() as *const c_void, payload.len() as i32, &mut written),
+                K_RESULT_OK
+            );
+            assert_eq!(written, 8);
+
+            // Negative write length must be rejected cleanly
+            assert_eq!(
+                bstream_write(this, payload.as_ptr() as *const c_void, -1, &mut written),
+                K_INVALID_ARGUMENT
+            );
+
+            // Write exceeding MAX_BSTREAM_BYTES must fail with K_OUT_OF_MEMORY (no OOM abort)
+            assert_eq!(
+                bstream_write(
+                    this,
+                    payload.as_ptr() as *const c_void,
+                    (MAX_BSTREAM_BYTES as i32) + 1,
+                    &mut written
+                ),
+                K_OUT_OF_MEMORY
+            );
+
+            // Seek overflow (cursor=8 + i64::MAX) must be rejected cleanly
+            let mut res = 0i64;
+            assert_eq!(bstream_seek(this, i64::MAX, 1, &mut res), K_INVALID_ARGUMENT);
+
+            // Negative seek target must be rejected cleanly
+            assert_eq!(bstream_seek(this, -5, 0, &mut res), K_INVALID_ARGUMENT);
+            assert_eq!(bstream_seek(this, -100, 1, &mut res), K_INVALID_ARGUMENT);
+
+            // Seek back to 0 and read back exact bytes
+            assert_eq!(bstream_seek(this, 0, 0, &mut res), K_RESULT_OK);
+            assert_eq!(res, 0);
+            let mut out = [0u8; 8];
+            let mut read_n = 0i32;
+            assert_eq!(
+                bstream_read(this, out.as_mut_ptr() as *mut c_void, 8, &mut read_n),
+                K_RESULT_OK
+            );
+            assert_eq!(read_n, 8);
+            assert_eq!(out, payload);
+        }
+    }
+
+    #[test]
+    fn test_host_attribute_list_binary_cap_and_retirement_no_uaf() {
+        let attr = HostAttributeList::new_boxed() as *mut c_void;
+
+        let key = CString::new("bin_key").unwrap();
+        let data_v1 = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let data_v2 = [0x11u8, 0x22, 0x33, 0x44, 0x55];
+
+        unsafe {
+            // Excessive binary size must be rejected with K_OUT_OF_MEMORY
+            assert_eq!(
+                attr_set_binary(
+                    attr,
+                    key.as_ptr(),
+                    data_v1.as_ptr() as *const c_void,
+                    (MAX_ATTR_BINARY_BYTES as u32) + 1
+                ),
+                K_OUT_OF_MEMORY
+            );
+
+            // Insert v1 and fetch pointer
+            assert_eq!(
+                attr_set_binary(attr, key.as_ptr(), data_v1.as_ptr() as *const c_void, data_v1.len() as u32),
+                K_RESULT_OK
+            );
+            let mut ptr1: *const c_void = ptr::null();
+            let mut len1: u32 = 0;
+            assert_eq!(attr_get_binary(attr, key.as_ptr(), &mut ptr1, &mut len1), K_RESULT_OK);
+            assert_eq!(len1, 4);
+
+            // Overwrite with v2; retired_binaries keeps ptr1 valid for the lifetime of HostAttributeList
+            assert_eq!(
+                attr_set_binary(attr, key.as_ptr(), data_v2.as_ptr() as *const c_void, data_v2.len() as u32),
+                K_RESULT_OK
+            );
+            let slice1 = std::slice::from_raw_parts(ptr1 as *const u8, len1 as usize);
+            assert_eq!(slice1, &data_v1);
+
+            let mut ptr2: *const c_void = ptr::null();
+            let mut len2: u32 = 0;
+            assert_eq!(attr_get_binary(attr, key.as_ptr(), &mut ptr2, &mut len2), K_RESULT_OK);
+            let slice2 = std::slice::from_raw_parts(ptr2 as *const u8, len2 as usize);
+            assert_eq!(slice2, &data_v2);
+
+            assert_eq!(attr_release(attr), 0);
+        }
+    }
+
+    #[test]
+    fn test_host_message_id_pointer_stability() {
+        let msg = HostMessage::new_boxed() as *mut c_void;
+        assert!(!msg.is_null());
+        let id1 = CString::new("AnalyzerPacketV1").unwrap();
+        let id2 = CString::new("AnalyzerPacketV2").unwrap();
+        unsafe {
+            msg_set_id(msg, id1.as_ptr());
+            let p1 = msg_get_id(msg);
+            assert!(!p1.is_null());
+            assert_eq!(CStr::from_ptr(p1).to_str().unwrap(), "AnalyzerPacketV1");
+
+            // Updating message ID must NOT invalidate p1 (kept alive until HostMessage drops)
+            msg_set_id(msg, id2.as_ptr());
+            let p2 = msg_get_id(msg);
+            assert_eq!(CStr::from_ptr(p1).to_str().unwrap(), "AnalyzerPacketV1");
+            assert_eq!(CStr::from_ptr(p2).to_str().unwrap(), "AnalyzerPacketV2");
+
+            assert_eq!(msg_release(msg), 0);
+        }
     }
 }

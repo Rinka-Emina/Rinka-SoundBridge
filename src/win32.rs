@@ -197,6 +197,20 @@ pub mod ffi {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct MEMORY_BASIC_INFORMATION {
+        pub BaseAddress: *mut c_void,
+        pub AllocationBase: *mut c_void,
+        pub AllocationProtect: DWORD,
+        #[cfg(target_pointer_width = "64")]
+        pub PartitionId: u16,
+        pub RegionSize: usize,
+        pub State: DWORD,
+        pub Protect: DWORD,
+        pub Type: DWORD,
+    }
+
+    #[repr(C)]
     #[derive(Clone, Copy, Default)]
     pub struct PROCESS_MEMORY_COUNTERS {
         pub cb: DWORD,
@@ -366,6 +380,11 @@ pub mod ffi {
             dwNumberOfBytesToMap: usize,
         ) -> *mut c_void;
         pub fn UnmapViewOfFile(lpBaseAddress: *const c_void) -> BOOL;
+        pub fn VirtualQuery(
+            lpAddress: *const c_void,
+            lpBuffer: *mut MEMORY_BASIC_INFORMATION,
+            dwLength: usize,
+        ) -> usize;
         pub fn GetProcessTimes(
             hProcess: HANDLE,
             lpCreationTime: *mut FILETIME,
@@ -380,40 +399,6 @@ pub mod ffi {
             ppsmemCounters: *mut PROCESS_MEMORY_COUNTERS,
             cb: DWORD,
         ) -> BOOL;
-        pub fn OpenProcess(
-            dwDesiredAccess: DWORD,
-            bInheritHandle: BOOL,
-            dwProcessId: DWORD,
-        ) -> HANDLE;
-        pub fn VirtualAllocEx(
-            hProcess: HANDLE,
-            lpAddress: *mut c_void,
-            dwSize: usize,
-            flAllocationType: DWORD,
-            flProtect: DWORD,
-        ) -> *mut c_void;
-        pub fn VirtualFreeEx(
-            hProcess: HANDLE,
-            lpAddress: *mut c_void,
-            dwSize: usize,
-            dwFreeType: DWORD,
-        ) -> BOOL;
-        pub fn WriteProcessMemory(
-            hProcess: HANDLE,
-            lpBaseAddress: *mut c_void,
-            lpBuffer: *const c_void,
-            nSize: usize,
-            lpNumberOfBytesWritten: *mut usize,
-        ) -> BOOL;
-        pub fn CreateRemoteThread(
-            hProcess: HANDLE,
-            lpThreadAttributes: *mut c_void,
-            dwStackSize: usize,
-            lpStartAddress: *const c_void,
-            lpParameter: *mut c_void,
-            dwCreationFlags: DWORD,
-            lpThreadId: *mut DWORD,
-        ) -> HANDLE;
     }
 
     #[link(name = "user32")]
@@ -435,6 +420,7 @@ pub mod ffi {
         pub fn SetForegroundWindow(hWnd: HWND) -> BOOL;
         pub fn FindWindowW(lpClassName: LPCWSTR, lpWindowName: LPCWSTR) -> HWND;
         pub fn GetForegroundWindow() -> HWND;
+        pub fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
         pub fn RegisterClassExW(lpWndClass: *const WNDCLASSEXW) -> u16;
         pub fn CreateWindowExW(
             dwExStyle: DWORD,
@@ -477,7 +463,6 @@ pub mod ffi {
         pub fn SendMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
         pub fn BringWindowToTop(hWnd: HWND) -> BOOL;
         pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: BOOL) -> BOOL;
-        pub fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: *mut DWORD) -> DWORD;
         pub fn LoadCursorW(hInstance: HINSTANCE, lpCursorName: LPCWSTR) -> HCURSOR;
         pub fn CreatePopupMenu() -> HMENU;
         pub fn AppendMenuW(hMenu: HMENU, uFlags: UINT, uIDNewItem: usize, lpNewItem: LPCWSTR) -> BOOL;
@@ -519,6 +504,7 @@ pub mod ffi {
     extern "system" {
         pub fn AvSetMmThreadCharacteristicsW(TaskName: LPCWSTR, TaskIndex: *mut DWORD) -> HANDLE;
         pub fn AvSetMmThreadPriority(AvrtHandle: HANDLE, Priority: i32) -> BOOL;
+        pub fn AvRevertMmThreadCharacteristics(AvrtHandle: HANDLE) -> BOOL;
     }
 
     #[link(name = "winmm")]
@@ -610,9 +596,9 @@ pub fn get_logical_cpu_count() -> u16 {
 }
 
 /// Mengatur CPU Core Affinity pada thread audio internal Rinka SoundBridge:
-/// - Di dalam proses host Voice Changer eksternal (`is_vc_host_process == true`, mis. `Vonovox.exe`),
+/// - Di dalam proses host Voice Changer eksternal (`is_vc_host_process == true`, mis. `python.exe` / AI VC),
 ///   JANGAN PERNAH membatasi CPU core affinity (`proc_mask` penuh tetap dipakai) agar thread pool
-///   PyTorch/DirectML/CUDA/RMVPE milik Vonovox tidak pernah mengalami CPU starvation atau tambahan stall.
+///   PyTorch/DirectML/CUDA/RMVPE milik AI Voice Changer tidak pernah mengalami CPU starvation atau tambahan stall.
 /// - Di dalam `RinkaSoundBridge.exe` (`is_vc_host_process == false`):
 ///   - `num_cores == 0`: Memakai seluruh core CPU yang diizinkan OS (`proc_mask`).
 ///   - `num_cores > 0`: Memilih sejumlah `num_cores` core (melewati Core 0 jika jumlah core mencukupi).
@@ -641,9 +627,19 @@ pub fn apply_asio_cpu_affinity(num_cores: u16, is_vc_host_process: bool) {
             let _ = ffi::SetThreadAffinityMask(ffi::GetCurrentThread(), proc_mask);
             return;
         }
-        let start_idx = if avail_bits.len() > wanted { 1 } else { 0 };
+        // Penting: Plugin Noise Suppression modern (Supertone Clear / Waves Clarity Vx / RNNoise / ONNX)
+        // membutuhkan beberapa core paralel sekaligus untuk inferensi neural real-time.
+        // Jika jumlah core dibatasi terlalu sempit (mis. hanya 2 thread = 1 physical core), Line A, Line B,
+        // dan thread pool ONNX milik Clear akan saling berebut 1 core yang sama dan memicu stutter!
+        // Karena itu, pastikan minimal 8 logical core (atau seluruh core selain Core 0 DPC) tetap diizinkan.
+        let eff_wanted = wanted.max((avail_bits.len().saturating_sub(2)).min(8));
+        if avail_bits.len() <= eff_wanted {
+            let _ = ffi::SetThreadAffinityMask(ffi::GetCurrentThread(), proc_mask);
+            return;
+        }
+        let start_idx = if avail_bits.len() > eff_wanted + 1 { 2 } else if avail_bits.len() > eff_wanted { 1 } else { 0 };
         let mut target_mask: usize = 0;
-        for &bit in avail_bits.iter().skip(start_idx).take(wanted) {
+        for &bit in avail_bits.iter().skip(start_idx).take(eff_wanted) {
             target_mask |= 1usize << bit;
         }
         if target_mask != 0 {
@@ -726,6 +722,69 @@ pub fn disable_windows_power_throttling() {
     }
 }
 
+#[cfg(windows)]
+struct ThreadAudioBoostGuard {
+    mmcss_handle: ffi::HANDLE,
+    com_initialized: bool,
+}
+
+#[cfg(windows)]
+impl Drop for ThreadAudioBoostGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.mmcss_handle.is_null() {
+                let _ = ffi::AvRevertMmThreadCharacteristics(self.mmcss_handle);
+                self.mmcss_handle = ptr::null_mut();
+            }
+            if self.com_initialized {
+                ffi::CoUninitialize();
+                self.com_initialized = false;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    static THREAD_AUDIO_BOOST: std::cell::RefCell<Option<ThreadAudioBoostGuard>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(windows)]
+unsafe fn ensure_thread_com_and_mmcss(want_mmcss: bool) -> (bool, bool) {
+    let mut mmcss_ok = false;
+    let mut com_ok = false;
+    let _ = THREAD_AUDIO_BOOST.try_with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let guard = slot.get_or_insert_with(|| {
+            let hr = ffi::CoInitializeEx(std::ptr::null_mut(), ffi::COINIT_MULTITHREADED);
+            // S_OK (0) and S_FALSE (1) both increment the thread's COM init count and require CoUninitialize.
+            let did_com = hr == 0 || hr == 1;
+            ThreadAudioBoostGuard {
+                mmcss_handle: ptr::null_mut(),
+                com_initialized: did_com,
+            }
+        });
+        com_ok = guard.com_initialized;
+        if want_mmcss {
+            if guard.mmcss_handle.is_null() {
+                let task = to_wide("Pro Audio");
+                let mut task_idx: ffi::DWORD = 0;
+                let h = ffi::AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_idx);
+                if !h.is_null() {
+                    // AVRT_PRIORITY_NORMAL = 0 so RSB VST3 worker threads never preempt ORION's CUDA FP32 stream!
+                    let _ = ffi::AvSetMmThreadPriority(h, 0);
+                    guard.mmcss_handle = h;
+                    mmcss_ok = true;
+                }
+            } else {
+                mmcss_ok = true;
+            }
+        }
+    });
+    (com_ok, mmcss_ok)
+}
+
 /// Daftarkan thread callback audio saat ini ke MMCSS 'Pro Audio', matikan EcoQoS throttling,
 /// dan aktifkan FTZ/DAZ denormal protection.
 pub fn boost_audio_thread() -> Option<&'static str> {
@@ -733,33 +792,28 @@ pub fn boost_audio_thread() -> Option<&'static str> {
     ensure_1ms_timer_resolution();
     disable_windows_power_throttling();
     apply_asio_cpu_affinity(get_asio_cpu_cores(), false);
+    let boost_on = AUDIO_PRIORITY_BOOST.load(Ordering::Relaxed);
     #[cfg(windows)]
     unsafe {
-        let _ = ffi::CoInitializeEx(std::ptr::null_mut(), ffi::COINIT_MULTITHREADED);
-    }
-
-    if !AUDIO_PRIORITY_BOOST.load(Ordering::Relaxed) {
-        return None;
-    }
-    #[cfg(windows)]
-    unsafe {
-        let task = to_wide("Pro Audio");
-        let mut task_idx: ffi::DWORD = 0;
-        let h = ffi::AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_idx);
-        if !h.is_null() {
-            // AVRT_PRIORITY_HIGH = 1 (prioritas tinggi MMCSS Pro Audio yang kooperatif dengan Audiodg.exe & GPU driver)
-            let _ = ffi::AvSetMmThreadPriority(h, 1);
+        let (_com_ok, mmcss_ok) = ensure_thread_com_and_mmcss(boost_on);
+        if !boost_on {
+            return None;
+        }
+        if mmcss_ok {
             return Some("MMCSS Pro Audio (High) + HighRes Timer + FTZ/DAZ");
         }
         if ffi::SetThreadPriority(ffi::GetCurrentThread(), ffi::THREAD_PRIORITY_HIGHEST) != 0 {
             return Some("THREAD_PRIORITY_HIGHEST + HighRes Timer + FTZ/DAZ");
         }
     }
+    if !boost_on {
+        return None;
+    }
     Some("FTZ/DAZ Active")
 }
 
 /// Daftarkan thread pump Virtual ASIO ke MMCSS 'Pro Audio' dengan prioritas NORMAL (0)
-/// agar presisi tinggi tetap terjaga tanpa pernah mengambil jatah CPU dari Audiodg.exe atau GPU RVC Vonovox.
+/// agar presisi tinggi tetap terjaga tanpa pernah mengambil jatah CPU dari Audiodg.exe atau GPU RVC host.
 pub fn boost_virtual_asio_pump_thread() {
     boost_virtual_asio_pump_thread_with_cores(get_asio_cpu_cores());
 }
@@ -771,16 +825,7 @@ pub fn boost_virtual_asio_pump_thread_with_cores(cpu_cores: u16) {
     apply_asio_cpu_affinity(cpu_cores, true);
     #[cfg(windows)]
     unsafe {
-        let _ = ffi::CoInitializeEx(std::ptr::null_mut(), ffi::COINIT_MULTITHREADED);
-        if AUDIO_PRIORITY_BOOST.load(Ordering::Relaxed) {
-            let task = to_wide("Pro Audio");
-            let mut task_idx: ffi::DWORD = 0;
-            let h = ffi::AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_idx);
-            if !h.is_null() {
-                // AVRT_PRIORITY_NORMAL = 0 di dalam kelas Pro Audio
-                let _ = ffi::AvSetMmThreadPriority(h, 0);
-            }
-        }
+        let _ = ensure_thread_com_and_mmcss(AUDIO_PRIORITY_BOOST.load(Ordering::Relaxed));
     }
 }
 
@@ -881,7 +926,9 @@ pub fn boost_process_priority() -> bool {
     }
     #[cfg(windows)]
     unsafe {
-        return ffi::SetPriorityClass(ffi::GetCurrentProcess(), ffi::ABOVE_NORMAL_PRIORITY_CLASS) != 0;
+        // Keep process base class at NORMAL (0x00000020) while individual audio callback threads use MMCSS Pro Audio,
+        // preventing Supertone Clear VST3 ONNX worker threads from starving ORIONs FP32 CUDA kernel launch thread!
+        ffi::SetPriorityClass(ffi::GetCurrentProcess(), 0x00000020) != 0
     }
     #[cfg(not(windows))]
     false
@@ -1066,32 +1113,34 @@ unsafe fn get_or_create_app_hicon(rgba_opt: Option<&[u8]>) -> ffi::HICON {
         }
     }
 
-    // 1. Coba muat dari Modules\icon.ico atau folder utama proyek
-    let base_dir = crate::logger::get_base_dir();
-    let mod_ico = crate::logger::get_modules_dir().join("icon.ico");
-    let root_ico = base_dir.join("icon.ico");
-    if root_ico.exists() && !mod_ico.exists() && !base_dir.join("Cargo.toml").exists() {
-        let _ = std::fs::rename(&root_ico, &mod_ico);
-    }
-    let ico_candidates = [
-        mod_ico,
-        root_ico,
-        base_dir.join("..").join("icon.ico"),
-    ];
-    for p in &ico_candidates {
-        if p.exists() {
-            let wpath = to_wide(&p.to_string_lossy());
-            let h = ffi::LoadImageW(
-                0,
-                wpath.as_ptr(),
-                ffi::IMAGE_ICON,
-                32,
-                32,
-                ffi::LR_LOADFROMFILE,
-            );
-            if h != 0 {
-                icon = h;
-                break;
+    // 1. Jika belum dapat, coba muat dari Modules\icon.ico atau folder utama proyek
+    if icon == 0 {
+        let base_dir = crate::logger::get_base_dir();
+        let mod_ico = crate::logger::get_modules_dir().join("icon.ico");
+        let root_ico = base_dir.join("icon.ico");
+        if root_ico.exists() && !mod_ico.exists() && !base_dir.join("Cargo.toml").exists() {
+            let _ = std::fs::rename(&root_ico, &mod_ico);
+        }
+        let ico_candidates = [
+            mod_ico,
+            root_ico,
+            base_dir.join("..").join("icon.ico"),
+        ];
+        for p in &ico_candidates {
+            if p.exists() {
+                let wpath = to_wide(&p.to_string_lossy());
+                let h = ffi::LoadImageW(
+                    0,
+                    wpath.as_ptr(),
+                    ffi::IMAGE_ICON,
+                    32,
+                    32,
+                    ffi::LR_LOADFROMFILE,
+                );
+                if h != 0 {
+                    icon = h;
+                    break;
+                }
             }
         }
     }
@@ -1123,15 +1172,7 @@ unsafe fn get_or_create_app_hicon(rgba_opt: Option<&[u8]>) -> ffi::HICON {
         }
     }
 
-    // 3. Coba resource icon #1 yang ditanam oleh winres di dalam RinkaSoundBridge.exe
-    if icon == 0 {
-        let h = ffi::LoadIconW(hinst, 1 as ffi::LPCWSTR);
-        if h != 0 {
-            icon = h;
-        }
-    }
-
-    // 4. Fallback terakhir
+    // 3. Fallback terakhir
     if icon == 0 {
         icon = ffi::LoadIconW(0, ffi::IDI_APPLICATION);
     }
@@ -1174,6 +1215,12 @@ unsafe fn restore_main_window_immediate() {
     TRAY_RESTORE_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+static CLEAN_SHUTDOWN_DONE: AtomicBool = AtomicBool::new(false);
+
+pub fn mark_clean_shutdown_complete() {
+    CLEAN_SHUTDOWN_DONE.store(true, Ordering::SeqCst);
+}
+
 /// Tutup aplikasi secara bersih langsung dari menu System Tray ("Quit Completely").
 #[cfg(windows)]
 unsafe fn quit_from_tray_immediate() {
@@ -1186,12 +1233,19 @@ unsafe fn quit_from_tray_immediate() {
         ffi::InvalidateRect(main_hwnd, std::ptr::null(), 1);
         let _ = ffi::PostMessageW(main_hwnd, ffi::WM_CLOSE, 0, 0);
     }
-    // Failsafe thread: jika dalam 800 ms proses belum tertutup oleh winit, tutup proses secara paksa
-    // agar tidak pernah nyangkut di Task Manager!
+    // Failsafe thread: beri waktu cukup (5000 ms) bagi `clean_shutdown()` menyelesaikan teardown VST3 & penyimpanan config
+    // sebelum memaksa keluar jika event loop winit macet.
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(800));
-        crate::logger::shutdown_logger();
-        std::process::exit(0);
+        for _ in 0..50 {
+            if CLEAN_SHUTDOWN_DONE.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if !CLEAN_SHUTDOWN_DONE.load(Ordering::Acquire) {
+            crate::logger::shutdown_logger();
+            std::process::exit(0);
+        }
     });
 }
 
@@ -1237,7 +1291,7 @@ impl SystemTrayManager {
                 std::ptr::null_mut(),
             );
             TRAY_MSG_HWND.store(msg_hwnd, Ordering::SeqCst);
-            return Self { msg_hwnd };
+            Self { msg_hwnd }
         }
         #[cfg(not(windows))]
         {
@@ -1258,8 +1312,15 @@ impl SystemTrayManager {
             if main_hwnd == 0 {
                 let fg = ffi::GetForegroundWindow();
                 if fg != 0 {
-                    main_hwnd = fg;
+                    let mut pid: ffi::DWORD = 0;
+                    ffi::GetWindowThreadProcessId(fg, &mut pid);
+                    if pid == std::process::id() {
+                        main_hwnd = fg;
+                    }
                 }
+            }
+            if main_hwnd == 0 {
+                main_hwnd = MAIN_WINDOW_HWND.load(Ordering::SeqCst);
             }
             if main_hwnd != 0 {
                 MAIN_WINDOW_HWND.store(main_hwnd, Ordering::SeqCst);
@@ -1275,10 +1336,10 @@ impl SystemTrayManager {
             nid.uCallbackMessage = ffi::WM_TRAYICON;
             nid.hIcon = app_icon;
 
-            for (i, c) in "Rinka SoundBridge v2.0 (Click to open)".encode_utf16().take(127).enumerate() {
+            for (i, c) in "Rinka SoundBridge v2.3 (Click to open)".encode_utf16().take(127).enumerate() {
                 nid.szTip[i] = c;
             }
-            for (i, c) in "Rinka SoundBridge v2.0".encode_utf16().take(63).enumerate() {
+            for (i, c) in "Rinka SoundBridge v2.3".encode_utf16().take(63).enumerate() {
                 nid.szInfoTitle[i] = c;
             }
             for (i, c) in "Running in System Tray. Click or right-click the tray icon to restore."
@@ -1359,50 +1420,53 @@ unsafe extern "system" fn tray_wndproc(
     wparam: ffi::WPARAM,
     lparam: ffi::LPARAM,
 ) -> ffi::LRESULT {
-    if msg == ffi::WM_TRAYICON {
-        let ev = (lparam & 0xFFFF) as u32;
-        // Baik klik kiri 1x (WM_LBUTTONUP) maupun klik kiri 2x (WM_LBUTTONDBLCLK) langsung membuka kembali aplikasi!
-        if ev == ffi::WM_LBUTTONUP || ev == ffi::WM_LBUTTONDBLCLK {
-            restore_main_window_immediate();
-            return 0;
-        } else if ev == ffi::WM_RBUTTONUP || ev == ffi::WM_CONTEXTMENU {
-            let hmenu = ffi::CreatePopupMenu();
-            if hmenu != 0 {
-                let open_str = to_wide("Open Rinka SoundBridge");
-                let quit_str = to_wide("Quit Completely");
-                ffi::AppendMenuW(hmenu, ffi::MF_STRING, 1, open_str.as_ptr());
-                ffi::AppendMenuW(hmenu, ffi::MF_SEPARATOR, 0, std::ptr::null());
-                ffi::AppendMenuW(hmenu, ffi::MF_STRING, 2, quit_str.as_ptr());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if msg == ffi::WM_TRAYICON {
+            let ev = (lparam & 0xFFFF) as u32;
+            // Baik klik kiri 1x (WM_LBUTTONUP) maupun klik kiri 2x (WM_LBUTTONDBLCLK) langsung membuka kembali aplikasi!
+            if ev == ffi::WM_LBUTTONUP || ev == ffi::WM_LBUTTONDBLCLK {
+                restore_main_window_immediate();
+                return 0;
+            } else if ev == ffi::WM_RBUTTONUP || ev == ffi::WM_CONTEXTMENU {
+                let hmenu = ffi::CreatePopupMenu();
+                if hmenu != 0 {
+                    let open_str = to_wide("Open Rinka SoundBridge");
+                    let quit_str = to_wide("Quit Completely");
+                    ffi::AppendMenuW(hmenu, ffi::MF_STRING, 1, open_str.as_ptr());
+                    ffi::AppendMenuW(hmenu, ffi::MF_SEPARATOR, 0, std::ptr::null());
+                    ffi::AppendMenuW(hmenu, ffi::MF_STRING, 2, quit_str.as_ptr());
 
-                let mut pt = ffi::POINT::default();
-                ffi::GetCursorPos(&mut pt);
-                ffi::SetForegroundWindow(hwnd);
-                let cmd = ffi::TrackPopupMenu(
-                    hmenu,
-                    ffi::TPM_RETURNCMD
-                        | ffi::TPM_NONOTIFY
-                        | ffi::TPM_RIGHTBUTTON
-                        | ffi::TPM_BOTTOMALIGN
-                        | ffi::TPM_LEFTALIGN,
-                    pt.x,
-                    pt.y,
-                    0,
-                    hwnd,
-                    std::ptr::null(),
-                );
-                let _ = ffi::PostMessageW(hwnd, ffi::WM_NULL, 0, 0);
-                ffi::DestroyMenu(hmenu);
+                    let mut pt = ffi::POINT::default();
+                    ffi::GetCursorPos(&mut pt);
+                    ffi::SetForegroundWindow(hwnd);
+                    let cmd = ffi::TrackPopupMenu(
+                        hmenu,
+                        ffi::TPM_RETURNCMD
+                            | ffi::TPM_NONOTIFY
+                            | ffi::TPM_RIGHTBUTTON
+                            | ffi::TPM_BOTTOMALIGN
+                            | ffi::TPM_LEFTALIGN,
+                        pt.x,
+                        pt.y,
+                        0,
+                        hwnd,
+                        std::ptr::null(),
+                    );
+                    let _ = ffi::PostMessageW(hwnd, ffi::WM_NULL, 0, 0);
+                    ffi::DestroyMenu(hmenu);
 
-                if cmd == 1 {
-                    restore_main_window_immediate();
-                } else if cmd == 2 {
-                    quit_from_tray_immediate();
+                    if cmd == 1 {
+                        restore_main_window_immediate();
+                    } else if cmd == 2 {
+                        quit_from_tray_immediate();
+                    }
                 }
+                return 0;
             }
-            return 0;
         }
-    }
-    ffi::DefWindowProcW(hwnd, msg, wparam, lparam)
+        ffi::DefWindowProcW(hwnd, msg, wparam, lparam)
+    }))
+    .unwrap_or_else(|_| ffi::DefWindowProcW(hwnd, msg, wparam, lparam))
 }
 
 /// Pangkas memori Working Set yang sudah tidak terpakai (mis. setelah inisialisasi DLL VST3 atau font)
@@ -1588,7 +1652,7 @@ pub fn resolve_module_from_address(addr: usize) -> (String, usize, usize) {
 // - TIDAK melakukan Overclocking (OC) dan TIDAK meminta input MHz manual.
 // - Otomatis mendeteksi kapabilitas maksimum GPU Boost bawaan pabrik (`max_graphics_mhz`)
 //   dari driver NVIDIA (`nvml.dll`) dan mengunci frekuensi P-State ke angka tersebut agar
-//   clock GPU tetap stabil (mis. 1980 MHz) dan tidak turun-naik di sela-sela chunk 300 ms Vonovox.
+//   clock GPU tetap stabil (mis. 1980 MHz) dan tidak turun-naik di sela-sela chunk 300 ms AI Voice Changer.
 // - Dilengkapi Auto Failsafe Watchdog (default ON): jika saat dikunci terjadi error driver,
 //   suhu GPU mencapai >= 83°C, atau clock drop tidak wajar (< 500 MHz), sistem otomatis
 //   membatalkan lock dan mengembalikan GPU ke mode dinamis standar (`-rgc`).
@@ -1644,6 +1708,7 @@ unsafe impl Sync for NvmlApi {}
 
 #[cfg(windows)]
 static NVML_API: std::sync::OnceLock<Option<NvmlApi>> = std::sync::OnceLock::new();
+static GPU_BOOST_LOCKED_ATOMIC: AtomicBool = AtomicBool::new(false);
 
 static GPU_SNAPSHOT: Mutex<GpuTelemetrySnapshot> = Mutex::new(GpuTelemetrySnapshot {
     available: false,
@@ -1661,8 +1726,8 @@ static GPU_SNAPSHOT: Mutex<GpuTelemetrySnapshot> = Mutex::new(GpuTelemetrySnapsh
 #[cfg(windows)]
 fn init_nvml_api() -> Option<NvmlApi> {
     unsafe {
+        // Hanya gunakan jalur absolut sistem tepercaya untuk mencegah DLL hijacking di direktori kerja/aplikasi
         let candidates = [
-            "nvml.dll",
             "C:\\Windows\\System32\\nvml.dll",
             "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll",
         ];
@@ -1704,11 +1769,13 @@ fn init_nvml_api() -> Option<NvmlApi> {
         let p_rst_lock = ffi::GetProcAddress(hmod, b"nvmlDeviceResetGpuLockedClocks\0".as_ptr());
 
         if p_handle.is_null() || p_clock.is_null() {
+            let _ = ffi::FreeLibrary(hmod);
             return None;
         }
         if !p_init.is_null() {
             let f_init: FnInit = std::mem::transmute(p_init);
             if f_init() != 0 {
+                let _ = ffi::FreeLibrary(hmod);
                 return None;
             }
         }
@@ -1716,6 +1783,7 @@ fn init_nvml_api() -> Option<NvmlApi> {
         let f_handle: FnGetHandle = std::mem::transmute(p_handle);
         let mut dev: *mut c_void = ptr::null_mut();
         if f_handle(0, &mut dev) != 0 || dev.is_null() {
+            let _ = ffi::FreeLibrary(hmod);
             return None;
         }
 
@@ -1767,11 +1835,10 @@ fn init_nvml_api() -> Option<NvmlApi> {
             }
         }
 
-        let auto_boost_mhz = if def_boost_mhz >= 1200 {
-            def_boost_mhz.min(hw_ceiling_mhz)
-        } else {
-            hw_ceiling_mhz.clamp(1350, 2400)
-        };
+        // CRITICAL FIX FOR LAPTOP GPUs:
+        // On NVIDIA Laptop GPUs, `DefaultApplicationsClock` (`def_boost_mhz`) is the TDP Base Clock (~1150-1380 MHz),
+        // NOT the Max Boost Clock (~2000-2500 MHz)! Locking max clock to `def_boost_mhz` cuts CUDA performance in half!
+        let auto_boost_mhz = hw_ceiling_mhz.max(def_boost_mhz).clamp(1650, 2650);
 
         let fn_get_temp = if !p_temp.is_null() {
             Some(std::mem::transmute::<*mut c_void, FnGetTemp>(p_temp))
@@ -1814,16 +1881,18 @@ unsafe fn force_unlock_gpu_clocks_quiet(api_opt: &Option<NvmlApi>) {
         }
     }
     if !unlocked {
+        // Hanya jalankan nvidia-smi.exe dari jalur absolut tepercaya saat menggunakan elevasi UAC (`runas`)
         let smi_candidates = [
             "C:\\Windows\\System32\\nvidia-smi.exe",
             "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe",
-            "nvidia-smi.exe",
         ];
-        let smi_exe = smi_candidates
+        let Some(smi_exe) = smi_candidates
             .iter()
             .find(|p| std::path::Path::new(p).exists())
             .copied()
-            .unwrap_or("nvidia-smi.exe");
+        else {
+            return;
+        };
         let w_op = to_wide("runas");
         let w_file = to_wide(smi_exe);
         let w_params = to_wide("-rgc");
@@ -1902,13 +1971,18 @@ pub fn poll_gpu_clock_telemetry_with_failsafe(failsafe_enabled: bool) -> GpuTele
                 }
 
                 if let Some(reason) = failsafe_reason {
-                    unsafe {
-                        force_unlock_gpu_clocks_quiet(api_opt);
-                    }
+                    GPU_BOOST_LOCKED_ATOMIC.store(false, Ordering::Release);
                     snap.is_boost_locked = false;
                     snap.low_clock_streak = 0;
                     snap.last_status_msg = "Failsafe Auto-Unlocked (Dynamic Clock Restored)".to_string();
                     snap.failsafe_triggered_msg = Some(reason);
+                    // Lepas kunci GPU_SNAPSHOT sebelum memanggil NVML/ShellExecuteW agar tidak memblokir UI/VEH
+                    let result_snap = snap.clone();
+                    drop(snap);
+                    unsafe {
+                        force_unlock_gpu_clocks_quiet(api_opt);
+                    }
+                    return result_snap;
                 }
             } else {
                 snap.low_clock_streak = 0;
@@ -1926,7 +2000,7 @@ pub fn poll_gpu_clock_telemetry_with_failsafe(failsafe_enabled: bool) -> GpuTele
                 snap.last_status_msg = "External GPU Utility Mode".to_string();
             }
         }
-        return snap.clone();
+        snap.clone()
     }
     #[cfg(not(windows))]
     {
@@ -1935,28 +2009,9 @@ pub fn poll_gpu_clock_telemetry_with_failsafe(failsafe_enabled: bool) -> GpuTele
     }
 }
 
-pub fn poll_gpu_clock_telemetry() -> GpuTelemetrySnapshot {
-    poll_gpu_clock_telemetry_with_failsafe(true)
-}
-
-pub fn get_gpu_telemetry_snapshot() -> GpuTelemetrySnapshot {
-    let snap = GPU_SNAPSHOT.lock();
-    if snap.gpu_name.is_empty() {
-        drop(snap);
-        return poll_gpu_clock_telemetry_with_failsafe(true);
-    }
-    snap.clone()
-}
-
 pub fn take_gpu_failsafe_alert() -> Option<String> {
     let mut snap = GPU_SNAPSHOT.lock();
     snap.failsafe_triggered_msg.take()
-}
-
-/// Mengaktifkan atau mematikan penguncian GPU Boost Clock (`Lock GPU Boost`) secara OTOMATIS
-/// mengikuti kemampuan maksimum GPU Boost kartu grafis (persis seperti EVGA Precision X1, tanpa OC manual).
-pub fn set_gpu_boost_clock_lock(enable: bool, _unused_manual_mhz: u32) -> Result<String, String> {
-    set_gpu_boost_clock_lock_with_failsafe(enable, true)
 }
 
 pub fn set_gpu_boost_clock_lock_with_failsafe(
@@ -2013,7 +2068,8 @@ pub fn set_gpu_boost_clock_lock_with_failsafe(
         if let Some(ref api) = api_opt {
             if enable {
                 if let Some(f_set) = api.fn_set_locked_clocks {
-                    let r = f_set(api.dev, auto_target_mhz, auto_target_mhz);
+                    let max_ceil = api.hw_ceiling_mhz.max(auto_target_mhz);
+                    let r = f_set(api.dev, auto_target_mhz, max_ceil);
                     if r == 0 {
                         nvml_direct_ok = true;
                     }
@@ -2030,13 +2086,17 @@ pub fn set_gpu_boost_clock_lock_with_failsafe(
             let smi_candidates = [
                 "C:\\Windows\\System32\\nvidia-smi.exe",
                 "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvidia-smi.exe",
-                "nvidia-smi.exe",
             ];
-            let smi_exe = smi_candidates
+            let Some(smi_exe) = smi_candidates
                 .iter()
                 .find(|p| std::path::Path::new(p).exists())
                 .copied()
-                .unwrap_or("nvidia-smi.exe");
+            else {
+                let mut snap = GPU_SNAPSHOT.lock();
+                snap.is_boost_locked = false;
+                snap.last_status_msg = "Lock Canceled / Trusted nvidia-smi.exe Not Found".to_string();
+                return Err("Trusted NVIDIA System Management Interface (nvidia-smi.exe) was not found in System32 or NVSMI.".to_string());
+            };
 
             let args = if enable {
                 format!("-lgc {},{}", auto_target_mhz, auto_target_mhz)
@@ -2086,6 +2146,7 @@ pub fn set_gpu_boost_clock_lock_with_failsafe(
         }
 
         {
+            GPU_BOOST_LOCKED_ATOMIC.store(enable, Ordering::Release);
             let mut snap = GPU_SNAPSHOT.lock();
             snap.is_boost_locked = enable;
             snap.locked_target_mhz = auto_target_mhz;
@@ -2126,7 +2187,16 @@ pub fn open_file_in_notepad(path: &std::path::Path) {
     #[cfg(windows)]
     unsafe {
         let w_op = to_wide("open");
-        let w_file = to_wide("notepad.exe");
+        let sys_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let sys32_notepad = format!("{}\\System32\\notepad.exe", sys_root.trim_end_matches('\\'));
+        let notepad_exe = if std::path::Path::new(&sys32_notepad).exists() {
+            sys32_notepad
+        } else if std::path::Path::new("C:\\Windows\\System32\\notepad.exe").exists() {
+            "C:\\Windows\\System32\\notepad.exe".to_string()
+        } else {
+            return;
+        };
+        let w_file = to_wide(&notepad_exe);
         let w_params = to_wide(&format!("\"{}\"", path.to_string_lossy()));
         let _ = ffi::ShellExecuteW(
             0,
@@ -2147,21 +2217,176 @@ pub fn open_file_in_notepad(path: &std::path::Path) {
 /// Otomatis dipanggil saat Rinka SoundBridge ditutup / dimatikan (atau mengalami crash):
 /// Mengembalikan GPU Boost Clock ke mode dinamis standar (Auto-Reset & Auto-Off) agar GPU
 /// tidak tetap terkunci di clock tinggi setelah aplikasi keluar.
+/// Dipanggil secara tenang (tanpa popup UAC) saat RSB pertama kali dinyalakan untuk memastikan
+/// GPU tidak tertahan di frekuensi rendah akibat sisa lock sesi sebelumnya.
+pub fn unlock_gpu_clocks_quiet_on_startup() {
+    #[cfg(windows)]
+    unsafe {
+        if let Some(ref api) = NVML_API.get_or_init(init_nvml_api) {
+            if let Some(f_rst) = api.fn_reset_locked_clocks {
+                let _ = f_rst(api.dev);
+            }
+        }
+    }
+}
+
+/// Varian aman untuk Vectored Exception Handler (VEH) / SEH crash handler:
+/// TIDAK pernah mengunci Mutex, TIDAK pernah memanggil `LoadLibraryW` (mencegah loader-lock deadlock),
+/// dan TIDAK pernah memicu popup UAC `ShellExecuteW`. Hanya mereset jika NVML sudah dimuat sebelumnya.
+pub fn reset_gpu_boost_clock_lock_on_crash() {
+    #[cfg(windows)]
+    unsafe {
+        if !GPU_BOOST_LOCKED_ATOMIC.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(Some(ref api)) = NVML_API.get() {
+            if let Some(f_rst) = api.fn_reset_locked_clocks {
+                let _ = f_rst(api.dev);
+            }
+        }
+    }
+}
+
 pub fn reset_gpu_boost_clock_lock_on_exit() {
     #[cfg(windows)]
     unsafe {
-        let was_locked = {
-            if let Some(mut g) = GPU_SNAPSHOT.try_lock() {
-                let locked = g.is_boost_locked;
-                g.is_boost_locked = false;
-                locked
-            } else {
-                true
-            }
+        let was_locked_atomic = GPU_BOOST_LOCKED_ATOMIC.swap(false, Ordering::AcqRel);
+        let was_locked_snap = if let Some(mut g) = GPU_SNAPSHOT.try_lock() {
+            let locked = g.is_boost_locked;
+            g.is_boost_locked = false;
+            locked
+        } else {
+            false
         };
-        if was_locked {
+        if was_locked_atomic || was_locked_snap {
             let api_opt = NVML_API.get_or_init(init_nvml_api);
             force_unlock_gpu_clocks_quiet(api_opt);
         }
+    }
+}
+
+/// Mengembalikan resolusi layar utama `(width, height)` dalam piksel menggunakan `GetSystemMetrics(0/1)`.
+pub fn get_primary_screen_size() -> (i32, i32) {
+    #[cfg(windows)]
+    unsafe {
+        let w = ffi::GetSystemMetrics(0);
+        let h = ffi::GetSystemMetrics(1);
+        if w >= 640 && h >= 480 {
+            return (w, h);
+        }
+    }
+    (1920, 1080)
+}
+
+/// Mengembalikan `true` jika jendela utama sedang disembunyikan ke System Tray (`TRAY_IS_ACTIVE`),
+/// tidak visible (`!IsWindowVisible`), atau diminimize ke taskbar (`IsIconic`).
+/// Dipakai oleh loop UI `eframe` untuk melewati render GPU saat jendela tidak terlihat.
+pub fn is_main_window_hidden_or_minimized(window_title: &str) -> bool {
+    if TRAY_IS_ACTIVE.load(Ordering::Acquire) {
+        return true;
+    }
+    #[cfg(windows)]
+    unsafe {
+        let mut hwnd = MAIN_WINDOW_HWND.load(Ordering::Acquire);
+        if hwnd == 0 {
+            let wtitle = to_wide(window_title);
+            hwnd = ffi::FindWindowW(std::ptr::null(), wtitle.as_ptr());
+            if hwnd != 0 {
+                MAIN_WINDOW_HWND.store(hwnd, Ordering::Release);
+            }
+        }
+        if hwnd != 0 {
+            if ffi::IsWindowVisible(hwnd) == 0 || ffi::IsIconic(hwnd) != 0 {
+                return true;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = window_title;
+    false
+}
+
+/// Daftarkan preferensi GPU Windows Graphics Settings -> "Power Saving (iGPU)" (`GpuPreference=1;`)
+/// untuk `RinkaSoundBridge.exe` di `HKCU\Software\Microsoft\DirectX\UserGpuPreferences` hanya jika
+/// belum ada entri sebelumnya (selalu menghormati pilihan manual user di Windows Graphics Settings).
+pub fn ensure_igpu_power_saving_preference_if_unset() {
+    #[cfg(windows)]
+    unsafe {
+        let Ok(exe_path) = std::env::current_exe() else {
+            return;
+        };
+        let canonical = std::fs::canonicalize(&exe_path).unwrap_or(exe_path);
+        let raw_exe = canonical.to_string_lossy();
+        let clean_exe = raw_exe.strip_prefix("\\\\?\\").unwrap_or(&raw_exe);
+        if clean_exe.is_empty() {
+            return;
+        }
+
+        let subkey = to_wide("Software\\Microsoft\\DirectX\\UserGpuPreferences");
+        let val_name = to_wide(clean_exe);
+        let mut hkey: ffi::HKEY = 0;
+        let mut disp: ffi::DWORD = 0;
+        let rc_create = ffi::RegCreateKeyExW(
+            ffi::HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            ptr::null_mut(),
+            0,
+            ffi::KEY_READ | ffi::KEY_WRITE,
+            ptr::null_mut(),
+            &mut hkey,
+            &mut disp,
+        );
+        if rc_create != 0 || hkey == 0 {
+            return;
+        }
+
+        let mut existing_type: ffi::DWORD = 0;
+        let mut existing_bytes: ffi::DWORD = 0;
+        let rc_query = ffi::RegQueryValueExW(
+            hkey,
+            val_name.as_ptr(),
+            ptr::null_mut(),
+            &mut existing_type,
+            ptr::null_mut(),
+            &mut existing_bytes,
+        );
+        if rc_query == 0 {
+            let _ = ffi::RegCloseKey(hkey);
+            return;
+        }
+
+        let pref_wide = to_wide("GpuPreference=1;");
+        let cb_data = (pref_wide.len() * std::mem::size_of::<u16>()) as ffi::DWORD;
+        let rc_set = ffi::RegSetValueExW(
+            hkey,
+            val_name.as_ptr(),
+            0,
+            ffi::REG_SZ,
+            pref_wide.as_ptr() as *const u8,
+            cb_data,
+        );
+        let _ = ffi::RegCloseKey(hkey);
+        if rc_set == 0 {
+            crate::logger::log_info(format!(
+                "[GPU] Configured Windows Power-Saving (iGPU) preference for {} to avoid NVIDIA CUDA contention on hybrid laptops.",
+                clean_exe
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_main_window_hidden_or_minimized_tracks_tray_flag() {
+        let prev = TRAY_IS_ACTIVE.swap(false, Ordering::SeqCst);
+        let title = "__RinkaNonExistentWindowTitleForUnitTest__";
+        assert!(!is_main_window_hidden_or_minimized(title));
+        TRAY_IS_ACTIVE.store(true, Ordering::SeqCst);
+        assert!(is_main_window_hidden_or_minimized(title));
+        TRAY_IS_ACTIVE.store(prev, Ordering::SeqCst);
     }
 }

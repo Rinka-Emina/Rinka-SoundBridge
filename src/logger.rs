@@ -351,7 +351,7 @@ unsafe fn log_ep_if_fatal(ep: *mut crate::win32::ffi::EXCEPTION_POINTERS, handle
         bt
     );
 
-    crate::win32::reset_gpu_boost_clock_lock_on_exit();
+    crate::win32::reset_gpu_boost_clock_lock_on_crash();
     write_crash_report_to_disk(&report);
 }
 
@@ -398,7 +398,7 @@ pub fn install_crash_handlers() {
         if need_reset {
             let header = format!(
                 "# ==============================================================================\n\
-                 # Rinka SoundBridge v2.0 - Log Diagnostik Crash (Vectored SEH & Rust Panic)\n\
+                 # Rinka SoundBridge v2.3 - Log Diagnostik Crash (Vectored SEH & Rust Panic)\n\
                  # Status Handler : AKTIF (Sesi Terakhir Dimulai: {})\n\
                  # Lokasi Log     : {}\n\
                  # Catatan        : Jika tidak ada blok [CRASH REPORT] di bawah baris ini,\n\
@@ -411,7 +411,7 @@ pub fn install_crash_handlers() {
         } else if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&crash_path) {
             let _ = writeln!(
                 f,
-                "\n# [INFO] Sesi baru dimulai pada {} (Handler Crash v2.0 Aktif)",
+                "\n# [INFO] Sesi baru dimulai pada {} (Handler Crash v2.3 Aktif)",
                 now_boot
             );
         }

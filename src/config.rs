@@ -1,5 +1,5 @@
-//! Manajemen Konfigurasi v2.0 (`rinka_soundbridge_config.json`)
-//! 100% kompatibel mundur dengan file konfigurasi v1.22 / v1.3,
+//! Manajemen Konfigurasi v2.3 (NEON) (`rinka_soundbridge_config.json`)
+//! 100% kompatibel mundur dengan file konfigurasi v1.22 / v1.3 / v2.0 / v2.1 / v2.2,
 //! ditambah konfigurasi **Triple ASIO (`asio_line_a`, `asio_line_b`, `asio_vc`)**
 //! yang masing-masing memiliki pilihan Input, Output, Buffer `smp`, Latency, WASAPI Set/Exclusive/AutoConvert, & Channels.
 
@@ -21,6 +21,7 @@ fn default_asio_lat_ms() -> f32 { 0.0 }
 fn default_dsp_cushion_ms() -> f32 { 60.0 }
 fn default_adaptive_extra_ms() -> f32 { 25.0 }
 fn default_gpu_stall_mult() -> f32 { 1.15 }
+fn default_stall_guard_ms() -> f32 { 15.0 }
 fn default_reported_in_ms() -> f32 { 304.0 }
 fn default_reported_out_ms() -> f32 { 16.0 }
 fn default_sample_rate() -> u32 { 48000 }
@@ -30,6 +31,8 @@ fn default_theme() -> String { DEFAULT_THEME_NAME.to_string() }
 fn default_fifo_mode() -> String { "adaptive".to_string() }
 fn default_driver_mode() -> String { "wasapi_shared".to_string() }
 fn default_asio_cpu_cores() -> u16 { 2 }
+fn default_auto_reset_mins() -> u32 { 60 }
+fn default_auto_reset_cooldown_mins() -> u32 { 10 }
 fn default_true() -> bool { true }
 fn default_vol() -> i32 { 100 }
 fn default_gain() -> f32 { 0.5 }
@@ -38,7 +41,7 @@ fn default_gain() -> f32 { 0.5 }
 /// Digunakan oleh:
 /// 1. `ASIO Line A` (Internal RSB Line A)
 /// 2. `ASIO Line B` (Internal RSB Line B)
-/// 3. `ASIO Khusus VC` (`"Rinka SoundBridge ASIO"` untuk Vonovox / Voice Changer)
+/// 3. `ASIO Khusus VC` (`"Rinka SoundBridge ASIO"` untuk AI Voice Changer)
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct FlexAsioProfileConfig {
     #[serde(default)]
@@ -75,6 +78,12 @@ pub struct FlexAsioProfileConfig {
     pub in_channels: u16,
     #[serde(default)]
     pub out_channels: u16,
+    #[serde(default = "default_true")]
+    pub auto_reset_enabled: bool,
+    #[serde(default = "default_auto_reset_mins")]
+    pub auto_reset_interval_mins: u32,
+    #[serde(default = "default_auto_reset_cooldown_mins")]
+    pub auto_reset_cooldown_mins: u32,
 }
 
 impl Default for FlexAsioProfileConfig {
@@ -95,6 +104,9 @@ impl Default for FlexAsioProfileConfig {
             wasapi_out_autoconvert: true,
             in_channels: 0,
             out_channels: 0,
+            auto_reset_enabled: true,
+            auto_reset_interval_mins: 60,
+            auto_reset_cooldown_mins: 10,
         }
     }
 }
@@ -139,6 +151,12 @@ pub struct GlobalConfig {
     pub gpu_boost_lock_mhz: u32,
     #[serde(default = "default_true")]
     pub gpu_boost_lock_failsafe: bool,
+    #[serde(default = "default_true")]
+    pub auto_reset_enabled: bool,
+    #[serde(default = "default_auto_reset_mins")]
+    pub auto_reset_interval_mins: u32,
+    #[serde(default = "default_auto_reset_cooldown_mins")]
+    pub auto_reset_cooldown_mins: u32,
 }
 
 fn default_gpu_lock_mhz() -> u32 {
@@ -167,6 +185,9 @@ impl Default for GlobalConfig {
             gpu_boost_lock_enabled: false,
             gpu_boost_lock_mhz: 1980,
             gpu_boost_lock_failsafe: true,
+            auto_reset_enabled: true,
+            auto_reset_interval_mins: 60,
+            auto_reset_cooldown_mins: 10,
         }
     }
 }
@@ -276,6 +297,23 @@ pub enum AdaptiveCushionMode {
     HybridDualFusion = 3,
     #[serde(rename = "predictive_preemptive_plc")]
     PredictivePreemptivePlc = 4,
+    #[serde(rename = "orion_hybrid_fusion", alias = "mode6_orion_sw")]
+    OrionHybridFusion = 5,
+}
+
+impl AdaptiveCushionMode {
+    #[inline]
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Self::PySyncInjection,
+            1 => Self::AsioStopwatchOutlier,
+            2 => Self::DecoupledPacing,
+            3 => Self::HybridDualFusion,
+            4 => Self::PredictivePreemptivePlc,
+            5 => Self::OrionHybridFusion,
+            _ => Self::HybridDualFusion,
+        }
+    }
 }
 
 impl Default for AdaptiveCushionMode {
@@ -306,6 +344,8 @@ pub struct DspRsbAsioConfig {
     pub adaptive_extra_ms: f32,
     #[serde(default = "default_gpu_stall_mult")]
     pub gpu_stall_multiplier: f32,
+    #[serde(default = "default_stall_guard_ms")]
+    pub stall_guard_ms: f32,
     #[serde(default = "default_true")]
     pub micro_stretch_rescue: bool,
     #[serde(default = "default_true")]
@@ -344,6 +384,12 @@ pub struct DspRsbAsioConfig {
     pub wasapi_out_autoconvert: bool,
     #[serde(default)]
     pub out_channels: u16,
+    #[serde(default = "default_true")]
+    pub auto_reset_enabled: bool,
+    #[serde(default = "default_auto_reset_mins")]
+    pub auto_reset_interval_mins: u32,
+    #[serde(default = "default_auto_reset_cooldown_mins")]
+    pub auto_reset_cooldown_mins: u32,
 }
 
 impl DspRsbAsioConfig {
@@ -370,6 +416,7 @@ impl Default for DspRsbAsioConfig {
             dsp_b_cushion_ms: 60.0,
             adaptive_extra_ms: 25.0,
             gpu_stall_multiplier: 1.15,
+            stall_guard_ms: 15.0,
             micro_stretch_rescue: true,
             adaptive_reported_latency: true,
             reported_in_ms: 304.0,
@@ -388,6 +435,9 @@ impl Default for DspRsbAsioConfig {
             wasapi_out_exclusive: false,
             wasapi_out_autoconvert: true,
             out_channels: 0,
+            auto_reset_enabled: true,
+            auto_reset_interval_mins: 60,
+            auto_reset_cooldown_mins: 10,
         }
     }
 }
@@ -396,7 +446,7 @@ impl Default for DspRsbAsioConfig {
 /// - Identik 1:1 dengan **FlexASIO GUI v0.35** (`Backend: Windows WASAPI`, `Set Buffer Size`,
 ///   `Input Device`, `Output Device`, `Output Preview`, `Set Input/Output Latency [0.0]`,
 ///   `WASAPI Set / Exclusive / AutoConvert`, `Channels`), ditambah fitur **`Auto-Sync Buffer Size with RSB`**.
-/// - Nama Driver ASIO di Windows Registry & Vonovox: `"RSB ASIO"` (`CLSID {D8E4A975-42B1-4C9A-9F31-8A7B6C5D4E05}`),
+/// - Nama Driver ASIO di Windows Registry & External VC: `"RSB ASIO"` (`CLSID {D8E4A975-42B1-4C9A-9F31-8A7B6C5D4E05}`),
 ///   sehingga 100% aman berdampingan dan tidak pernah konflik dengan FlexASIO eksternal.
 /// - Tidak memiliki buffer/cushion buatan maupun auto-report kustom; bekerja murni seperti FlexASIO standar.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -415,13 +465,13 @@ pub struct RsbAsioConfig {
     #[serde(default)]
     pub output_device: String,
 
-    /// FlexASIO `suggestedLatencySeconds` untuk `[input]` (default `true` dengan nilai `0.0` detik, persis FlexASIO GUI)
+    /// Tambahan latensi `[input]` dalam milidetik (`0.0` s/d `1000.0` ms, default `0.0` ms)
     #[serde(default = "default_true")]
     pub set_in_latency_enabled: bool,
     #[serde(default = "default_asio_lat_ms")]
     pub in_latency_val: f32,
 
-    /// FlexASIO `suggestedLatencySeconds` untuk `[output]` (default `true` dengan nilai `0.0` detik, persis FlexASIO GUI)
+    /// Tambahan latensi `[output]` dalam milidetik (`0.0` s/d `1000.0` ms, default `0.0` ms)
     #[serde(default = "default_true")]
     pub set_out_latency_enabled: bool,
     #[serde(default = "default_asio_lat_ms")]
@@ -444,6 +494,12 @@ pub struct RsbAsioConfig {
     pub wasapi_out_autoconvert: bool,
     #[serde(default)]
     pub out_channels: u16,
+    #[serde(default = "default_true")]
+    pub auto_reset_enabled: bool,
+    #[serde(default = "default_auto_reset_mins")]
+    pub auto_reset_interval_mins: u32,
+    #[serde(default = "default_auto_reset_cooldown_mins")]
+    pub auto_reset_cooldown_mins: u32,
 }
 
 impl RsbAsioConfig {
@@ -474,7 +530,8 @@ impl RsbAsioConfig {
         };
         lines.push(format!("device = \"{}\"", in_dev));
         if self.set_in_latency_enabled {
-            lines.push(format!("suggestedLatencySeconds = {:.1}", self.in_latency_val.max(0.0)));
+            let in_ms = self.in_latency_val.clamp(0.0, 1000.0);
+            lines.push(format!("suggestedLatencySeconds = {:.3} # ({:.0} ms)", in_ms / 1000.0, in_ms));
         }
         if self.wasapi_in_set {
             lines.push(format!(
@@ -499,7 +556,8 @@ impl RsbAsioConfig {
         };
         lines.push(format!("device = \"{}\"", out_dev));
         if self.set_out_latency_enabled {
-            lines.push(format!("suggestedLatencySeconds = {:.1}", self.out_latency_val.max(0.0)));
+            let out_ms = self.out_latency_val.clamp(0.0, 1000.0);
+            lines.push(format!("suggestedLatencySeconds = {:.3} # ({:.0} ms)", out_ms / 1000.0, out_ms));
         }
         if self.wasapi_out_set {
             lines.push(format!(
@@ -539,6 +597,9 @@ impl Default for RsbAsioConfig {
             wasapi_out_exclusive: false,
             wasapi_out_autoconvert: true,
             out_channels: 0,
+            auto_reset_enabled: true,
+            auto_reset_interval_mins: 60,
+            auto_reset_cooldown_mins: 10,
         }
     }
 }
@@ -645,16 +706,26 @@ impl AppConfig {
                             }
                             cfg.asio_dsp_rsb.cpu_cores_user_configured = true;
                         }
-                        // Jangan pernah menimpa nilai dsp_b_cushion_ms yang diinput user (baik 60, 70, 90, 100, maupun 200 ms)!
+                        // Jangan pernah menimpa nilai dsp_b_cushion_ms yang diinput user (termasuk 0 ms untuk testing)!
                         if !cfg.asio_dsp_rsb.dsp_b_cushion_ms.is_finite()
-                            || cfg.asio_dsp_rsb.dsp_b_cushion_ms <= 0.0
+                            || cfg.asio_dsp_rsb.dsp_b_cushion_ms < 0.0
                         {
                             cfg.asio_dsp_rsb.dsp_b_cushion_ms = 60.0;
                         }
                         cfg.asio_dsp_rsb.dsp_b_cushion_ms =
-                            cfg.asio_dsp_rsb.dsp_b_cushion_ms.clamp(20.0, 450.0);
+                            cfg.asio_dsp_rsb.dsp_b_cushion_ms.clamp(0.0, 450.0);
+                        if !cfg.asio_dsp_rsb.gpu_stall_multiplier.is_finite() {
+                            cfg.asio_dsp_rsb.gpu_stall_multiplier = 1.15;
+                        }
                         cfg.asio_dsp_rsb.gpu_stall_multiplier =
                             cfg.asio_dsp_rsb.gpu_stall_multiplier.clamp(1.00, 1.30);
+                        if !cfg.asio_dsp_rsb.stall_guard_ms.is_finite()
+                            || cfg.asio_dsp_rsb.stall_guard_ms < 0.0
+                        {
+                            cfg.asio_dsp_rsb.stall_guard_ms = 15.0;
+                        }
+                        cfg.asio_dsp_rsb.stall_guard_ms =
+                            cfg.asio_dsp_rsb.stall_guard_ms.clamp(0.0, 150.0);
                         if !cfg.asio_dsp_rsb.adaptive_extra_ms.is_finite() || cfg.asio_dsp_rsb.adaptive_extra_ms < 0.0 {
                             cfg.asio_dsp_rsb.adaptive_extra_ms = 25.0;
                         }
@@ -662,31 +733,36 @@ impl AppConfig {
                         // 4-Point Catmull-Rom Cubic Drift Synchronization selalu aktif secara otomatis di background
                         cfg.asio_dsp_rsb.micro_stretch_rescue = true;
 
-                        if cfg.asio_dsp_rsb.reported_in_ms <= 0.0
+                        if !cfg.asio_dsp_rsb.reported_in_ms.is_finite()
+                            || cfg.asio_dsp_rsb.reported_in_ms <= 0.0
                             || (cfg.asio_dsp_rsb.adaptive_reported_latency
                                 && cfg.asio_dsp_rsb.reported_in_ms >= 480.0)
                         {
                             cfg.asio_dsp_rsb.reported_in_ms = 304.0;
                         }
-                        if cfg.asio_dsp_rsb.reported_out_ms <= 0.0
+                        if !cfg.asio_dsp_rsb.reported_out_ms.is_finite()
+                            || cfg.asio_dsp_rsb.reported_out_ms <= 0.0
                             || (cfg.asio_dsp_rsb.adaptive_reported_latency
                                 && cfg.asio_dsp_rsb.reported_out_ms >= 180.0)
                         {
                             cfg.asio_dsp_rsb.reported_out_ms = 16.0;
                         }
-                        // Normalisasi nilai warisan 2.0 (dari satuan ms lama) pada rsb_asio & asio_dsp_rsb
-                        // agar tidak pernah terbaca sebagai 2.0 detik (2000.0 ms)!
-                        if !cfg.rsb_asio.in_latency_val.is_finite()
-                            || cfg.rsb_asio.in_latency_val < 0.0
-                            || cfg.rsb_asio.in_latency_val >= 0.5
-                        {
-                            cfg.rsb_asio.in_latency_val = 0.0;
+                        if !cfg.global.asio_set_in_latency.is_finite() || cfg.global.asio_set_in_latency < 0.0 {
+                            cfg.global.asio_set_in_latency = 0.0;
                         }
-                        if !cfg.rsb_asio.out_latency_val.is_finite()
-                            || cfg.rsb_asio.out_latency_val < 0.0
-                            || cfg.rsb_asio.out_latency_val >= 0.5
-                        {
+                        if !cfg.global.asio_set_out_latency.is_finite() || cfg.global.asio_set_out_latency < 0.0 {
+                            cfg.global.asio_set_out_latency = 0.0;
+                        }
+                        // Validasi rentang Set Latency RSB ASIO dalam milidetik (0.0 ..= 1000.0 ms)
+                        if !cfg.rsb_asio.in_latency_val.is_finite() || cfg.rsb_asio.in_latency_val < 0.0 {
+                            cfg.rsb_asio.in_latency_val = 0.0;
+                        } else if cfg.rsb_asio.in_latency_val > 1000.0 {
+                            cfg.rsb_asio.in_latency_val = 1000.0;
+                        }
+                        if !cfg.rsb_asio.out_latency_val.is_finite() || cfg.rsb_asio.out_latency_val < 0.0 {
                             cfg.rsb_asio.out_latency_val = 0.0;
+                        } else if cfg.rsb_asio.out_latency_val > 1000.0 {
+                            cfg.rsb_asio.out_latency_val = 1000.0;
                         }
                         if !cfg.asio_dsp_rsb.in_latency_val.is_finite()
                             || cfg.asio_dsp_rsb.in_latency_val < 0.0
@@ -702,6 +778,29 @@ impl AppConfig {
                             cfg.asio_dsp_rsb.set_out_latency_enabled = false;
                             cfg.asio_dsp_rsb.out_latency_val = 0.0;
                         }
+                        if cfg.asio_dsp_rsb.auto_reset_interval_mins == 0 {
+                            cfg.asio_dsp_rsb.auto_reset_interval_mins = 60;
+                        }
+                        cfg.asio_dsp_rsb.auto_reset_interval_mins =
+                            cfg.asio_dsp_rsb.auto_reset_interval_mins.clamp(1, 240);
+                        if cfg.asio_dsp_rsb.auto_reset_cooldown_mins == 0 {
+                            cfg.asio_dsp_rsb.auto_reset_cooldown_mins = 10;
+                        }
+                        cfg.asio_dsp_rsb.auto_reset_cooldown_mins =
+                            cfg.asio_dsp_rsb.auto_reset_cooldown_mins.clamp(1, 240);
+                        if cfg.global.auto_reset_interval_mins == 0 {
+                            cfg.global.auto_reset_interval_mins = cfg.asio_dsp_rsb.auto_reset_interval_mins;
+                        }
+                        cfg.global.auto_reset_interval_mins =
+                            cfg.global.auto_reset_interval_mins.clamp(1, 240);
+                        if cfg.global.auto_reset_cooldown_mins == 0 {
+                            cfg.global.auto_reset_cooldown_mins = cfg.asio_dsp_rsb.auto_reset_cooldown_mins;
+                        }
+                        cfg.global.auto_reset_cooldown_mins =
+                            cfg.global.auto_reset_cooldown_mins.clamp(1, 240);
+                        cfg.rsb_asio.auto_reset_enabled = cfg.asio_dsp_rsb.auto_reset_enabled;
+                        cfg.rsb_asio.auto_reset_interval_mins = cfg.asio_dsp_rsb.auto_reset_interval_mins;
+                        cfg.rsb_asio.auto_reset_cooldown_mins = cfg.asio_dsp_rsb.auto_reset_cooldown_mins;
                         return Some(cfg);
                     }
                     Err(e) => {
@@ -751,8 +850,9 @@ impl AppConfig {
 
 
 pub const DEFAULT_ASIO_NOTES_TEXT: &str = "⚠️ PENTING / RECOMMENDED: Gunakan aplikasi pihak ke-3 (seperti MSI Afterburner atau EVGA Precision X1) untuk melakukan Lock GPU Boost Clock dibanding fitur Built-in GPU Boost Lock di atas; fitur Built-in Lock hanya disediakan sebagai cadangan jika diperlukan.\n\
-💡 PERFORMANCE & LOW-LATENCY TIP (AI Voice Changer / Vonovox / RVC):\n\
-Mengunci frekuensi GPU Boost Clock (mis. melalui MSI Afterburner / EVGA Precision X1) mencegah penurunan frekuensi (P-state downclocking) di sela-sela chunk suara 200-300 ms, sehingga GPU Delay tetap rata/stabil dan kualitas suara real-time 100% bebas stutter.";
+💡 PERFORMANCE & LOW-LATENCY TIP (Rinka SoundBridge v2.3 + ORION / AI Voice Changer / RVC):\n\
+Mengunci frekuensi GPU Boost Clock (mis. melalui MSI Afterburner / EVGA Precision X1) mencegah penurunan frekuensi (P-state downclocking) di sela-sela chunk suara 200-300 ms, sehingga GPU Delay tetap rata/stabil dan kualitas suara real-time 100% bebas stutter.\n\
+🚀 ORION Direct RAM Pipe: Gunakan Driver \"🚀 ORION\" + Mode 6 (ORION SW-Fusion) untuk latensi terendah dengan Lock-Free SPSC Ring Buffer & Auto-Recovery anti-stuck-delay saat mengubah setting di tengah konversi.";
 
 pub fn get_asio_notes_txt_path() -> PathBuf {
     get_savedata_dir().join("asio_performance_notes.txt")

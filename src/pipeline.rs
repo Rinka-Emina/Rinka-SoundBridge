@@ -1,11 +1,11 @@
-//! Dual-Line Multi-Driver Audio Pipeline v2.0 (`AudioPipeline`)
+//! Dual-Line Multi-Driver Audio Pipeline v2.3 NEON (`AudioPipeline`)
 //! Mendukung 4 Backend Driver Audio secara Native:
 //! 1. `WASAPI Shared` (Auto-Convert, ramah multi-aplikasi OBS/Discord)
 //! 2. `WASAPI Exclusive` (Direct hardware buffer via COM `IAudioClient` Exclusive Event-Driven + auto-fallback)
 //! 3. `ASIO Native` (Direct Steinberg COM `IASIO` via Registry `HKLM\SOFTWARE\ASIO` + Control Panel)
 //! 4. `ASIO Experimental (Flex-Bridge)` (Event-Driven Low-Latency AutoConvert + Jembatan Langsung `Rinka SoundBridge ASIO`)
 //!
-//! Dilengkapi peningkatan kualitas suara & performa v2.0:
+//! Dilengkapi peningkatan kualitas suara & performa v2.3 NEON:
 //! - Zero-Allocation Real-Time Callback (`AudioScratchBuffers`)
 //! - Hardware Denormal Killer (`FTZ`/`DAZ` di `boost_audio_thread`) & Windows 11 EcoQoS Disabler
 //! - Zero-Latency 20Hz Pre-VST DC Blocker & Sub-Sonic Filter (`DcBlockerStereo`)
@@ -25,7 +25,21 @@ use crate::fifo::{FifoStats, FifoVariant};
 use crate::logger::{log_error, log_info, log_warn, record_breadcrumb};
 use crate::config::{DspRsbAsioConfig, FlexAsioProfileConfig, RsbAsioConfig};
 use crate::vst3_host::VSTSlot;
-use crate::wasapi_exclusive::{FlexAsioEndpointOptions, WasapiExclusivePair, WasapiFlexAsioPair};
+use crate::wasapi_exclusive::{
+    FlexAsioEndpointOptions, WasapiEndpointTarget, WasapiExclusivePair, WasapiFlexAsioPair,
+};
+
+pub const LATENCY_PROBE_WINDOW_SECS: f64 = 2.8;
+
+/// Normalizes a millisecond latency configuration value without misinterpreting `<= 2.0 ms` as seconds.
+#[inline]
+pub fn normalize_latency_ms(val_ms: f32) -> f32 {
+    if !val_ms.is_finite() {
+        0.0
+    } else {
+        val_ms.clamp(0.0, 2000.0)
+    }
+}
 
 /// Standalone Virtual ASIO ID 1 (Line A Output -> sent to Voice Changer Input)
 pub const ASIO_LINE_A_OUT_DEVICE_NAME: &str =
@@ -78,6 +92,7 @@ pub enum DriverBackend {
     AsioExperimental,
     AsioDspRsb,
     RsbAsio,
+    OrionDirect,
 }
 
 impl DriverBackend {
@@ -89,11 +104,13 @@ impl DriverBackend {
             Self::AsioExperimental => "asio_experimental",
             Self::AsioDspRsb => "asio_dsp_rsb",
             Self::RsbAsio => "rsb_asio",
+            Self::OrionDirect => "orion",
         }
     }
 
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_lowercase().as_str() {
+            "orion" | "orion_direct" | "orion_ram" => Self::OrionDirect,
             "asio" | "asio_native" => Self::AsioNative,
             "rsb_asio" | "rsb_flex_asio" | "builtin_flexasio" => Self::RsbAsio,
             "soundbridge_asio"
@@ -113,6 +130,7 @@ impl DriverBackend {
             Self::AsioNative => "ASIO Native",
             Self::RsbAsio => "Rsb ASIO (Experimental)",
             Self::AsioDspRsb | Self::AsioExperimental => "SoundBridge ASIO (Experimental)",
+            Self::OrionDirect => "ORION",
         }
     }
 }
@@ -182,6 +200,9 @@ pub struct SharedAudioState {
     pub active_sample_rate: AtomicU32,
     pub buffer_size: AtomicU32,
     pub actual_in_frames: AtomicU32,
+    pub actual_out_frames: AtomicU32,
+    pub hw_cap_frames: AtomicU32,
+    pub hw_ren_frames: AtomicU32,
     pub is_asio_experimental: AtomicBool,
     pub is_asio_dsp_rsb: AtomicBool,
     pub is_rsb_asio: AtomicBool,
@@ -198,6 +219,7 @@ pub struct SharedAudioState {
     pub in_xruns: AtomicU64,
     pub out_xruns: AtomicU64,
     pub stream_faulted: AtomicBool,
+    pub streams_running_flag: AtomicBool,
     pub fifo: FifoVariant,
     pub dc_blocker: Mutex<DcBlockerStereo>,
     pub chain: ArcSwap<Vec<Arc<VSTSlot>>>,
@@ -299,6 +321,9 @@ impl AudioPipeline {
             active_sample_rate: AtomicU32::new(48000),
             buffer_size: AtomicU32::new(256),
             actual_in_frames: AtomicU32::new(256),
+            actual_out_frames: AtomicU32::new(256),
+            hw_cap_frames: AtomicU32::new(0),
+            hw_ren_frames: AtomicU32::new(0),
             is_asio_experimental: AtomicBool::new(false),
             is_asio_dsp_rsb: AtomicBool::new(false),
             is_rsb_asio: AtomicBool::new(false),
@@ -315,11 +340,12 @@ impl AudioPipeline {
             in_xruns: AtomicU64::new(0),
             out_xruns: AtomicU64::new(0),
             stream_faulted: AtomicBool::new(false),
+            streams_running_flag: AtomicBool::new(false),
             fifo: FifoVariant::new("adaptive", 16384),
             dc_blocker: Mutex::new(DcBlockerStereo::new(48000)),
             chain: ArcSwap::from_pointee(Vec::new()),
-            probe_in: LatencyProbe::new(1.8, 48000),
-            probe_out: LatencyProbe::new(1.8, 48000),
+            probe_in: LatencyProbe::new(LATENCY_PROBE_WINDOW_SECS, 48000),
+            probe_out: LatencyProbe::new(LATENCY_PROBE_WINDOW_SECS, 48000),
             overlay_input_bank: OverlayBank::new(),
             overlay_output_bank: OverlayBank::new(),
         });
@@ -391,10 +417,6 @@ impl AudioPipeline {
         }
     }
 
-    pub fn master_gain(&self) -> f32 {
-        f32::from_bits(self.shared.master_gain_bits.load(Ordering::Relaxed))
-    }
-
     pub fn set_master_gain(&self, gain: f32) {
         self.shared
             .master_gain_bits
@@ -441,6 +463,41 @@ impl AudioPipeline {
         }
     }
 
+    /// Hitung durasi quantum / padding buffer hardware aktual (Capture pada Line A, Render pada Line B,
+    /// termasuk padding render WASAPI Shared / buffer penuh WASAPI Exclusive / `IASIO::getLatencies`) dalam milidetik.
+    pub fn estimated_hw_quantum_ms(&self) -> f64 {
+        let sr = self.effective_sample_rate().max(44100) as f64;
+        let hw_cap = self.shared.hw_cap_frames.load(Ordering::Relaxed) as usize;
+        let hw_ren = self.shared.hw_ren_frames.load(Ordering::Relaxed) as usize;
+        let act_in = self.shared.actual_in_frames.load(Ordering::Relaxed) as usize;
+        let act_out = self.shared.actual_out_frames.load(Ordering::Relaxed) as usize;
+        let fallback_smp = if self.driver_backend == DriverBackend::RsbAsio {
+            (self.rsb_asio_config.effective_buffer_size(self.buffer_size) as usize).clamp(64, 512)
+        } else if self.driver_backend == DriverBackend::AsioDspRsb || self.driver_backend == DriverBackend::OrionDirect {
+            (self.dsp_rsb_config.effective_buffer_size(self.buffer_size) as usize).clamp(64, 512)
+        } else {
+            (self.buffer_size as usize).clamp(64, 2048)
+        };
+        let hw_smp = if self.name == "Line B" {
+            if hw_ren > 0 {
+                hw_ren.clamp(64, 8192)
+            } else if act_out > 0 {
+                act_out.clamp(64, 4096)
+            } else if act_in > 0 {
+                act_in.clamp(64, 4096)
+            } else {
+                fallback_smp
+            }
+        } else if hw_cap > 0 {
+            hw_cap.clamp(64, 8192)
+        } else if act_in > 0 {
+            act_in.clamp(64, 4096)
+        } else {
+            fallback_smp
+        };
+        (hw_smp as f64 / sr) * 1000.0
+    }
+
     /// Hitung estimasi delay real-time aktual Line ini (Buffer Hardware Aktual + FIFO + Lookahead Vokal Aktif) dalam milidetik.
     pub fn estimated_line_latency_ms(&self) -> Option<f64> {
         if !self.is_enabled() || !self.streams_running() {
@@ -453,30 +510,45 @@ impl AudioPipeline {
             && self.output_device_name.as_deref().map(is_virtual_line_a_out_name).unwrap_or(false);
         let is_vc_direct_b =
             self.name == "Line B" && self.shared.is_direct_bridge_in.load(Ordering::Relaxed);
-        let actual_hw = self.shared.actual_in_frames.load(Ordering::Relaxed) as usize;
+        let actual_hw = if self.name == "Line B" {
+            let hw_ren = self.shared.hw_ren_frames.load(Ordering::Relaxed) as usize;
+            let act_out = self.shared.actual_out_frames.load(Ordering::Relaxed) as usize;
+            let act_in = self.shared.actual_in_frames.load(Ordering::Relaxed) as usize;
+            if hw_ren > 0 {
+                hw_ren
+            } else if act_out > 0 {
+                act_out
+            } else {
+                act_in
+            }
+        } else {
+            let hw_cap = self.shared.hw_cap_frames.load(Ordering::Relaxed) as usize;
+            let act_in = self.shared.actual_in_frames.load(Ordering::Relaxed) as usize;
+            if hw_cap > 0 { hw_cap } else { act_in }
+        };
         let (hw_samples, fifo_samples) = if self.driver_backend == DriverBackend::RsbAsio {
             let smp = self.rsb_asio_config.effective_buffer_size(self.buffer_size) as usize;
-            let hw_q = smp.clamp(64, 512);
+            let hw_q = if actual_hw > 0 { actual_hw.clamp(64, 8192) } else { smp.clamp(64, 512) };
             if self.name == "Line A" {
                 let v = self.rsb_asio_config.in_latency_val;
-                let extra_in = if self.rsb_asio_config.set_in_latency_enabled && v > 0.0 && v < 0.5 {
-                    ((v.min(0.040) as f64) * sr) as usize
+                let extra_in = if self.rsb_asio_config.set_in_latency_enabled && v > 0.0 {
+                    (((v.clamp(0.0, 1000.0) as f64) / 1000.0) * sr) as usize
                 } else {
                     0
                 };
                 (hw_q, extra_in)
             } else {
                 let v = self.rsb_asio_config.out_latency_val;
-                let extra_out = if self.rsb_asio_config.set_out_latency_enabled && v > 0.0 && v < 0.5 {
-                    ((v.min(0.040) as f64) * sr) as usize
+                let extra_out = if self.rsb_asio_config.set_out_latency_enabled && v > 0.0 {
+                    (((v.clamp(0.0, 1000.0) as f64) / 1000.0) * sr) as usize
                 } else {
                     0
                 };
                 (hw_q, extra_out)
             }
-        } else if self.driver_backend == DriverBackend::AsioDspRsb {
+        } else if self.driver_backend == DriverBackend::AsioDspRsb || self.driver_backend == DriverBackend::OrionDirect {
             let smp = self.dsp_rsb_config.effective_buffer_size(self.buffer_size) as usize;
-            let hw_q = smp.clamp(64, 512);
+            let hw_q = if actual_hw > 0 { actual_hw.clamp(64, 8192) } else { smp.clamp(64, 512) };
             if self.name == "Line A" {
                 let extra_in = if self.dsp_rsb_config.set_in_latency_enabled {
                     ((self.dsp_rsb_config.in_latency_val.max(0.0) as f64 / 1000.0) * sr) as usize
@@ -520,7 +592,7 @@ impl AudioPipeline {
             (0, ff)
         } else {
             let hw = if actual_hw > 0 {
-                actual_hw.min(self.buffer_size as usize)
+                actual_hw.clamp(64, 8192)
             } else {
                 self.buffer_size as usize
             };
@@ -531,30 +603,22 @@ impl AudioPipeline {
             };
             (hw, ff)
         };
-        let max_realtime_vst_hop = ((sr * 0.040) as usize).max(1920);
         let vst_realtime_samples: usize = self
             .vst_slots
             .iter()
             .filter(|s| !s.is_bypassed())
-            .map(|s| {
-                let raw = s.latency_samples.load(Ordering::Relaxed) as usize;
-                raw.min(max_realtime_vst_hop)
-            })
+            .map(|s| effective_vst_slot_latency_samples(s, sr).0)
             .sum();
         let total_samples = hw_samples + fifo_samples + vst_realtime_samples;
         Some((total_samples as f64 / sr) * 1000.0)
     }
 
-    /// Total PDC mentah yang dilaporkan oleh `IAudioProcessor::getLatencySamples()` (untuk info diagnostik tooltip).
-    pub fn reported_vst_pdc_ms(&self) -> f64 {
-        let sr = self.effective_sample_rate().max(44100) as f64;
-        let raw_samples: usize = self
-            .vst_slots
-            .iter()
-            .filter(|s| !s.is_bypassed())
-            .map(|s| s.latency_samples.load(Ordering::Relaxed) as usize)
-            .sum();
-        (raw_samples as f64 / sr) * 1000.0
+    #[inline]
+    fn set_engine(&mut self, eng: ActiveStreamEngine) {
+        self.shared
+            .streams_running_flag
+            .store(!matches!(eng, ActiveStreamEngine::None), Ordering::Release);
+        self.engine = eng;
     }
 
     pub fn streams_running(&self) -> bool {
@@ -600,11 +664,41 @@ impl AudioPipeline {
         self.gave_up = false;
     }
 
+    /// Fast (<0.5 ms) non-disruptive in-place micro-reset for periodic Auto-Reset:
+    /// Clears FIFO, DC blocker, and VST3 states in place without tearing down active Windows WASAPI/ASIO streams!
+    pub fn fast_micro_reset_in_place(&mut self) {
+        if !self.is_enabled() {
+            return;
+        }
+        if !self.streams_running() || self.shared.stream_faulted.load(Ordering::Relaxed) {
+            self.restart_stream();
+            return;
+        }
+        self.shared.fifo.lock().reset();
+        self.shared.dc_blocker.lock().reset();
+        for slot in &self.vst_slots {
+            slot.reset_pending.store(true, Ordering::Relaxed);
+            slot.flush_pending.store(true, Ordering::Relaxed);
+        }
+        if self.name == "Line A" {
+            // Strict SPSC: Line A is producer on BUS_DSP_A_OUT; never overwrite `read_pos` while downstream VC/ORION is reading!
+            let bus_a = get_dsp_rsb_bus_a_out();
+            if !bus_a.is_vc_active() {
+                bus_a.reset();
+            }
+        } else if self.name == "Line B" {
+            get_dsp_rsb_bus_b_in().reset_spike_and_resync_cushion();
+        }
+    }
+
     pub fn stop_stream(&mut self) {
-        self.engine = ActiveStreamEngine::None;
+        self.set_engine(ActiveStreamEngine::None);
         if self.name == "Line A" {
             get_asio_bus_line_a_out().mark_writer_stopped();
             get_dsp_rsb_bus_a_out().mark_writer_stopped();
+            get_dsp_rsb_bus_a_out().set_rsb_driver_mode(4);
+        } else if self.name == "Line B" {
+            get_dsp_rsb_bus_b_in().set_rsb_driver_mode(4);
         }
         self.shared.fifo.lock().reset();
         self.shared.dc_blocker.lock().reset();
@@ -650,7 +744,7 @@ impl AudioPipeline {
         self.shared.stream_faulted.store(false, Ordering::Relaxed);
         self.shared.buffer_size.store(self.buffer_size, Ordering::Relaxed);
         let is_exp = self.driver_backend == DriverBackend::AsioExperimental;
-        let is_dsp_rsb = self.driver_backend == DriverBackend::AsioDspRsb;
+        let is_dsp_rsb = self.driver_backend == DriverBackend::AsioDspRsb || self.driver_backend == DriverBackend::OrionDirect;
         let is_rsb_asio = self.driver_backend == DriverBackend::RsbAsio;
         let unified_smp = self.buffer_size.clamp(32, 1024);
         self.asio_exp_in_samples = unified_smp;
@@ -691,7 +785,7 @@ impl AudioPipeline {
             };
         let dsp_sr = self.sample_rate.clamp(44100, 192000);
         let dsp_smp = self.dsp_rsb_config.effective_buffer_size(self.buffer_size);
-        let eff_cush_ms = self.dsp_rsb_config.dsp_b_cushion_ms.clamp(20.0, 450.0);
+        let eff_cush_ms = self.dsp_rsb_config.dsp_b_cushion_ms.clamp(0.0, 450.0);
         let dsp_cush_smp = (((eff_cush_ms as f64) / 1000.0) * (dsp_sr as f64)).round() as u32;
         let dsp_cush_clamped = dsp_cush_smp.min(24000);
         let dsp_stretch_flag = 1u32;
@@ -712,9 +806,20 @@ impl AudioPipeline {
             eff_rep_out,
         );
 
+        let rsb_drv_mode_code: u8 = match self.driver_backend {
+            DriverBackend::AsioDspRsb => 1,
+            DriverBackend::RsbAsio => 2,
+            DriverBackend::OrionDirect => 3,
+            _ => 4,
+        };
         get_asio_bus_line_a_out().sync_config(self.sample_rate, unified_smp, dsp_rep_in_smp, dsp_rep_out_smp);
         get_asio_bus_line_b_in().sync_config(self.sample_rate, unified_smp, dsp_rep_in_smp, dsp_rep_out_smp);
         get_dsp_rsb_bus_a_out().sync_config(dsp_sr, dsp_smp, dsp_rep_in_smp, dsp_rep_out_smp);
+        if self.name == "Line A" {
+            get_dsp_rsb_bus_a_out().set_rsb_driver_mode(rsb_drv_mode_code);
+        } else if self.name == "Line B" {
+            get_dsp_rsb_bus_b_in().set_rsb_driver_mode(rsb_drv_mode_code);
+        }
         get_dsp_rsb_bus_b_in().set_adaptive_flags_with_mult(
             self.dsp_rsb_config.adaptive_cushion,
             self.dsp_rsb_config.adaptive_reported_latency,
@@ -722,10 +827,14 @@ impl AudioPipeline {
         );
         get_dsp_rsb_bus_b_in().set_adaptive_mode(self.dsp_rsb_config.adaptive_mode as u8);
         get_dsp_rsb_bus_b_in().set_user_extra_buffer_ms(self.dsp_rsb_config.adaptive_extra_ms);
+        get_dsp_rsb_bus_b_in().set_user_stall_guard_ms(self.dsp_rsb_config.stall_guard_ms);
         get_dsp_rsb_bus_b_in().sync_config(dsp_sr, dsp_smp, dsp_stretch_flag, dsp_cush_clamped);
         if self.name == "Line A" {
-            get_asio_bus_line_a_out().reset();
-            get_dsp_rsb_bus_a_out().reset_reader_with_cushion((dsp_smp as usize * 4).clamp(1200, 1920));
+            let bus_a = get_dsp_rsb_bus_a_out();
+            if !bus_a.is_vc_active() {
+                get_asio_bus_line_a_out().reset();
+                bus_a.reset_reader_with_cushion((dsp_smp as usize * 4).clamp(1200, 1920));
+            }
         } else {
             let cushion = (out_lat_smp as usize).max(unified_smp as usize) + 480;
             get_asio_bus_line_b_in().reset_reader_with_cushion(cushion);
@@ -739,7 +848,7 @@ impl AudioPipeline {
         match self.driver_backend {
             DriverBackend::AsioNative => self.start_asio_backend(),
             DriverBackend::AsioExperimental => self.start_asio_experimental_backend(),
-            DriverBackend::AsioDspRsb => self.start_asio_dsp_rsb_backend(),
+            DriverBackend::AsioDspRsb | DriverBackend::OrionDirect => self.start_asio_dsp_rsb_backend(),
             DriverBackend::RsbAsio => self.start_rsb_asio_backend(),
             DriverBackend::WasapiExclusive => self.start_wasapi_backend(true),
             DriverBackend::WasapiShared => self.start_wasapi_backend(false),
@@ -783,21 +892,25 @@ impl AudioPipeline {
                 let active_sr = handle.active_sample_rate;
                 let active_buf = handle.active_buffer_size;
                 self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
-                self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                self.shared.hw_cap_frames.store(handle.driver_in_latency_samples, Ordering::Relaxed);
+                self.shared.hw_ren_frames.store(handle.driver_out_latency_samples, Ordering::Relaxed);
+                self.shared.actual_in_frames.store(active_buf, Ordering::Relaxed);
+                self.shared.actual_out_frames.store(active_buf, Ordering::Relaxed);
+                self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                 self.sync_overlay_rates(active_sr);
                 {
                     let fifo = self.shared.fifo.lock();
                     fifo.configure(active_buf as usize, Some(active_sr as f64));
                 }
-                self.engine = ActiveStreamEngine::Asio { _handle: handle };
                 self.status_message = format!(
                     "🎹 ASIO Native Active ({} @ {}Hz / {} smp)",
                     drv_name, active_sr, active_buf
                 );
+                self.set_engine(ActiveStreamEngine::Asio { _handle: handle });
             }
             Err(e) => {
-                self.status_message = format!("⚠️ ASIO Error: {}", &e.chars().take(38).collect::<String>());
+                self.status_message = format!("⚠️ ASIO Error: {}", e.chars().take(38).collect::<String>());
                 log_error(format!("[{}] ASIO gagal: {}", self.name, e));
             }
         }
@@ -834,40 +947,34 @@ impl AudioPipeline {
 
         let host = cpal::default_host();
 
-        let in_idx_opt = if is_virtual_in_b {
+        let in_tgt_opt = if is_virtual_in_b {
             None
         } else {
-            let found = host
+            let exists = host
                 .input_devices()
                 .ok()
-                .and_then(|it| {
-                    it.enumerate()
-                        .find(|(_, d)| d.name().ok().as_deref() == Some(in_name.as_str()))
-                })
-                .map(|(idx, _)| idx);
-            if found.is_none() {
+                .map(|mut it| it.any(|d| d.name().ok().as_deref() == Some(in_name.as_str())))
+                .unwrap_or(false);
+            if !exists {
                 self.status_message = "⚠️ Error: ASIO Input not found".to_string();
                 return;
             }
-            found
+            Some(WasapiEndpointTarget::ByName(in_name.clone()))
         };
 
-        let out_idx_opt = if is_virtual_out_a {
+        let out_tgt_opt = if is_virtual_out_a {
             None
         } else {
-            let found = host
+            let exists = host
                 .output_devices()
                 .ok()
-                .and_then(|it| {
-                    it.enumerate()
-                        .find(|(_, d)| d.name().ok().as_deref() == Some(out_name.as_str()))
-                })
-                .map(|(idx, _)| idx);
-            if found.is_none() {
+                .map(|mut it| it.any(|d| d.name().ok().as_deref() == Some(out_name.as_str())))
+                .unwrap_or(false);
+            if !exists {
                 self.status_message = "⚠️ Error: ASIO Output not found".to_string();
                 return;
             }
-            found
+            Some(WasapiEndpointTarget::ByName(out_name.clone()))
         };
 
         let unified_smp = self.buffer_size.clamp(32, 2048);
@@ -920,8 +1027,8 @@ impl AudioPipeline {
         let mut scratch_direct = AudioScratchBuffers::with_capacity((unified_smp as usize).max(1024) * 4);
 
         let flex_res = WasapiFlexAsioPair::try_start_with_options(
-            in_idx_opt,
-            out_idx_opt,
+            in_tgt_opt,
+            out_tgt_opt,
             self.sample_rate,
             unified_smp,
             in_opts,
@@ -965,11 +1072,14 @@ impl AudioPipeline {
             Ok(pair) => {
                 let active_sr = pair.active_sample_rate;
                 let act_in = pair.actual_in_buf;
-                let _act_out = pair.actual_out_buf;
+                let act_out = pair.actual_out_buf;
                 self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
                 self.shared.actual_in_frames.store(act_in, Ordering::Relaxed);
-                self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                self.shared.actual_out_frames.store(act_out, Ordering::Relaxed);
+                self.shared.hw_cap_frames.store(pair.actual_in_hw_frames, Ordering::Relaxed);
+                self.shared.hw_ren_frames.store(pair.actual_out_hw_frames, Ordering::Relaxed);
+                self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                 self.sync_overlay_rates(active_sr);
                 if active_sr != self.sample_rate {
                     let extra_in_smp = set_in_opt
@@ -1008,7 +1118,7 @@ impl AudioPipeline {
                         unified_smp, in_lat_str, out_lat_str, active_sr
                     )
                 };
-                self.engine = ActiveStreamEngine::AsioExperimental { _pair: pair };
+                self.set_engine(ActiveStreamEngine::AsioExperimental { _pair: pair });
             }
             Err(flex_err) => {
                 log_warn(format!(
@@ -1028,17 +1138,19 @@ impl AudioPipeline {
     /// Mode `WASAPI + ASIO Bridge` (`DriverBackend::AsioDspRsb`):
     /// - **Line A (`In A -> VST Chain A -> Out A`)**: 100% **WASAPI Murni**!
     ///   User memilih `Line A Input` secara manual (WASAPI Capture), diproses oleh VST3 Chain Line A,
-    ///   dan `Line A Output` mengalir **otomatis** ke jembatan tunggal ASIO (`BUS_DSP_A_OUT` -> Input Vonovox).
+    ///   dan `Line A Output` mengalir **otomatis** ke jembatan tunggal ASIO (`BUS_DSP_A_OUT` -> Input External VC).
     /// - **Line B (`In B -> VST Chain B -> Out B`)**: 100% **WASAPI Murni**!
-    ///   `Line B Input` menerima **otomatis** dari jembatan tunggal ASIO (`BUS_DSP_B_IN` <- Output Vonovox),
+    ///   `Line B Input` menerima **otomatis** dari jembatan tunggal ASIO (`BUS_DSP_B_IN` <- Output External VC),
     ///   diproses oleh VST3 Chain Line B, dan mengalir ke `Line B Output` yang dipilih manual (WASAPI Render).
     /// - **Jembatan `A Out -> B In`**: Satu-satunya jalur ASIO di seluruh sistem (`Rinka SoundBridge ASIO`),
     ///   menggunakan **Adaptive FlexASIO Reported Latency (`504.0 ms / 210.7 ms`)** & **Adaptive GPU Cushion**.
     fn start_asio_dsp_rsb_backend(&mut self) {
+        let _ = crate::asio_host::get_dsp_rsb_bus_a_out().check_and_clear_coord_reset_flag();
+        let _ = crate::asio_host::get_dsp_rsb_bus_b_in().check_and_clear_coord_reset_flag();
         let host = cpal::default_host();
         let target_sr = self.sample_rate.clamp(44100, 192000);
         let unified_smp = self.dsp_rsb_config.effective_buffer_size(self.buffer_size);
-        let eff_cush_ms = self.dsp_rsb_config.dsp_b_cushion_ms.clamp(20.0, 450.0);
+        let eff_cush_ms = self.dsp_rsb_config.dsp_b_cushion_ms.clamp(0.0, 450.0);
         let dsp_cush_smp = (((eff_cush_ms as f64) / 1000.0) * (target_sr as f64)).round() as usize;
         let dsp_cush_clamped = dsp_cush_smp.min(24000);
         let stretch_flag = 1u32;
@@ -1055,7 +1167,7 @@ impl AudioPipeline {
 
         // 1. JALUR UTAMA FULL ASIO: Gunakan mesin Event-Driven Low-Latency ASIO (`WasapiFlexAsioPair`)
         //    dari Input A -> Output A (ASIO Bridge) -> Input B (ASIO Bridge) -> Output B!
-        let (in_idx_opt, out_idx_opt) = if self.name == "Line A" {
+        let (in_tgt_opt, out_tgt_opt) = if self.name == "Line A" {
             let Some(ref in_name) = self.input_device_name else {
                 self.status_message = "⚪ Inactive - select Line A Input (ASIO)".to_string();
                 return;
@@ -1064,19 +1176,16 @@ impl AudioPipeline {
                 self.status_message = "⚪ Inactive - select Line A Input (ASIO)".to_string();
                 return;
             }
-            let found_in = host
+            let exists = host
                 .input_devices()
                 .ok()
-                .and_then(|it| {
-                    it.enumerate()
-                        .find(|(_, d)| d.name().ok().as_deref() == Some(in_name.as_str()))
-                })
-                .map(|(idx, _)| idx);
-            if found_in.is_none() {
+                .map(|mut it| it.any(|d| d.name().ok().as_deref() == Some(in_name.as_str())))
+                .unwrap_or(false);
+            if !exists {
                 self.status_message = "⚠️ Error: Line A Input not found".to_string();
                 return;
             }
-            (found_in, None)
+            (Some(WasapiEndpointTarget::ByName(in_name.clone())), None)
         } else {
             let Some(ref out_name) = self.output_device_name else {
                 self.status_message = "⚪ Inactive - select Line B Output (ASIO)".to_string();
@@ -1086,30 +1195,26 @@ impl AudioPipeline {
                 self.status_message = "⚪ Inactive - select Line B Output (ASIO)".to_string();
                 return;
             }
-            let found_out = host
+            let exists = host
                 .output_devices()
                 .ok()
-                .and_then(|it| {
-                    it.enumerate()
-                        .find(|(_, d)| d.name().ok().as_deref() == Some(out_name.as_str()))
-                })
-                .map(|(idx, _)| idx);
-            if found_out.is_none() {
+                .map(|mut it| it.any(|d| d.name().ok().as_deref() == Some(out_name.as_str())))
+                .unwrap_or(false);
+            if !exists {
                 self.status_message = "⚠️ Error: Line B Output not found".to_string();
                 return;
             }
-            (None, found_out)
+            (None, Some(WasapiEndpointTarget::ByName(out_name.clone())))
         };
 
+        // `in_latency_val` & `out_latency_val` are always in milliseconds (never multiply <= 2.0 by 1000!).
         let set_in_opt = if self.dsp_rsb_config.set_in_latency_enabled {
-            let v = self.dsp_rsb_config.in_latency_val.max(0.0);
-            Some(if v <= 2.0 { (v * 1000.0).min(2000.0) } else { v.min(2000.0) })
+            Some(normalize_latency_ms(self.dsp_rsb_config.in_latency_val))
         } else {
             Some(0.0)
         };
         let set_out_opt = if self.dsp_rsb_config.set_out_latency_enabled {
-            let v = self.dsp_rsb_config.out_latency_val.max(0.0);
-            Some(if v <= 2.0 { (v * 1000.0).min(2000.0) } else { v.min(2000.0) })
+            Some(normalize_latency_ms(self.dsp_rsb_config.out_latency_val))
         } else {
             Some(0.0)
         };
@@ -1135,8 +1240,8 @@ impl AudioPipeline {
         let mut scratch_direct = AudioScratchBuffers::with_capacity((unified_smp as usize).max(1024) * 4);
 
         let dsp_res = WasapiFlexAsioPair::try_start_with_options(
-            in_idx_opt,
-            out_idx_opt,
+            in_tgt_opt,
+            out_tgt_opt,
             target_sr,
             unified_smp,
             in_opts,
@@ -1153,13 +1258,24 @@ impl AudioPipeline {
                     let t0 = Instant::now();
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         scratch_direct.ensure_frames(frames);
-                        let (cush_target, stretch_en) = get_dsp_rsb_bus_b_in().get_dsp_b_params();
-                        get_dsp_rsb_bus_b_in().read_stereo_dsp_b_into(
-                            &mut scratch_direct.bus_l[..frames],
-                            &mut scratch_direct.bus_r[..frames],
-                            cush_target,
-                            stretch_en,
-                        );
+                        let b_bus = get_dsp_rsb_bus_b_in();
+                        let b_mode = b_bus.get_rsb_driver_mode();
+                        let vc_hb = b_bus.is_vc_active();
+                        // Strict Driver Mode Isolation on Line B:
+                        // If RSB is set to `Driver: 🚀 ORION` (`b_mode == 3`), only play audio when ORION's Direct RAM Pipe
+                        // (`vc_hb`) or ASIO writer matching `b_mode` is active!
+                        if (b_mode == 3 && !vc_hb) || b_mode == 4 {
+                            scratch_direct.bus_l[..frames].fill(0.0);
+                            scratch_direct.bus_r[..frames].fill(0.0);
+                        } else {
+                            let (cush_target, stretch_en) = b_bus.get_dsp_b_params();
+                            b_bus.read_stereo_dsp_b_into(
+                                &mut scratch_direct.bus_l[..frames],
+                                &mut scratch_direct.bus_r[..frames],
+                                cush_target,
+                                stretch_en,
+                            );
+                        }
                         process_and_render_direct_stereo_from_scratch(
                             &shared_out,
                             &mut scratch_direct,
@@ -1179,10 +1295,14 @@ impl AudioPipeline {
             Ok(pair) => {
                 let active_sr = pair.active_sample_rate;
                 let act_in = pair.actual_in_buf;
+                let act_out = pair.actual_out_buf;
                 self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
                 self.shared.actual_in_frames.store(act_in, Ordering::Relaxed);
-                self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                self.shared.actual_out_frames.store(act_out, Ordering::Relaxed);
+                self.shared.hw_cap_frames.store(pair.actual_in_hw_frames, Ordering::Relaxed);
+                self.shared.hw_ren_frames.store(pair.actual_out_hw_frames, Ordering::Relaxed);
+                self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                 self.sync_overlay_rates(active_sr);
                 let (rep_in_smp, rep_out_smp) = compute_asio_reported_latency_samples(
                     active_sr,
@@ -1198,14 +1318,29 @@ impl AudioPipeline {
                 );
                 get_dsp_rsb_bus_b_in().set_adaptive_mode(self.dsp_rsb_config.adaptive_mode as u8);
                 get_dsp_rsb_bus_b_in().set_user_extra_buffer_ms(self.dsp_rsb_config.adaptive_extra_ms);
+                get_dsp_rsb_bus_b_in().set_user_stall_guard_ms(self.dsp_rsb_config.stall_guard_ms);
                 get_dsp_rsb_bus_b_in().sync_config(
                     active_sr,
                     unified_smp,
                     stretch_flag,
                     dsp_cush_clamped as u32,
                 );
+                let mode_code_now: u8 = match self.driver_backend {
+                    DriverBackend::AsioDspRsb => 1,
+                    DriverBackend::RsbAsio => 2,
+                    DriverBackend::OrionDirect => 3,
+                    _ => 4,
+                };
                 if self.name == "Line A" {
-                    get_dsp_rsb_bus_a_out().reset_reader_with_cushion((unified_smp as usize * 4).clamp(1200, 1920));
+                    get_dsp_rsb_bus_a_out().set_rsb_driver_mode(mode_code_now);
+                } else {
+                    get_dsp_rsb_bus_b_in().set_rsb_driver_mode(mode_code_now);
+                }
+                if self.name == "Line A" {
+                    let bus_a = get_dsp_rsb_bus_a_out();
+                    if !bus_a.is_vc_active() {
+                        bus_a.reset_reader_with_cushion((unified_smp as usize * 4).clamp(1200, 1920));
+                    }
                 }
                 self.status_message = if self.name == "Line A" {
                     format!(
@@ -1218,7 +1353,7 @@ impl AudioPipeline {
                         unified_smp, active_sr
                     )
                 };
-                self.engine = ActiveStreamEngine::AsioExperimental { _pair: pair };
+                self.set_engine(ActiveStreamEngine::AsioExperimental { _pair: pair });
                 return;
             }
             Err(e) => {
@@ -1247,8 +1382,8 @@ impl AudioPipeline {
                         self.in_channels = act_ch;
                         self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
                         self.shared.actual_in_frames.store(unified_smp, Ordering::Relaxed);
-                        self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                        self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                        self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                        self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                         self.sync_overlay_rates(active_sr);
                         let (rep_in_smp, rep_out_smp) = compute_asio_reported_latency_samples(
                             active_sr,
@@ -1262,10 +1397,10 @@ impl AudioPipeline {
                             "⚡ ASIO [A In ({}ch) -> VST -> ASIO Bridge Out @ {}Hz]",
                             act_ch, active_sr
                         );
-                        self.engine = ActiveStreamEngine::WasapiShared {
+                        self.set_engine(ActiveStreamEngine::WasapiShared {
                             _in_stream: Some(ins),
                             _out_stream: None,
-                        };
+                        });
                         return;
                     }
                 }
@@ -1288,8 +1423,8 @@ impl AudioPipeline {
                         self.out_channels = act_ch;
                         self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
                         self.shared.actual_in_frames.store(unified_smp, Ordering::Relaxed);
-                        self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                        self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                        self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                        self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                         self.sync_overlay_rates(active_sr);
                         get_dsp_rsb_bus_b_in().sync_config(
                             active_sr,
@@ -1301,10 +1436,10 @@ impl AudioPipeline {
                             "⚡ ASIO [ASIO Bridge In -> VST -> B Out ({}ch) @ {}Hz]",
                             act_ch, active_sr
                         );
-                        self.engine = ActiveStreamEngine::WasapiShared {
+                        self.set_engine(ActiveStreamEngine::WasapiShared {
                             _in_stream: None,
                             _out_stream: Some(outs),
-                        };
+                        });
                         return;
                     }
                 }
@@ -1315,20 +1450,27 @@ impl AudioPipeline {
 
     /// Mode `RSB ASIO (Built-in FlexASIO)` (`DriverBackend::RsbAsio`):
     /// - Arsitektur Internal Loopback (Tanpa Virtual Cable):
-    ///   `WASAPI In A (Mic Input A) -> VST A -> Out A [Internal RSB ASIO] -> Vonovox ("ASIO: RSB ASIO") -> Loopback In B [Internal RSB ASIO] -> WASAPI Loopback B -> VST B -> WASAPI Out B (Speaker Output B)`
+    ///   `WASAPI In A (Mic Input A) -> VST A -> Out A [Internal RSB ASIO] -> External VC ("ASIO: RSB ASIO") -> Loopback In B [Internal RSB ASIO] -> WASAPI Loopback B -> VST B -> WASAPI Out B (Speaker Output B)`
     /// - Menggunakan WASAPI Event-Driven Ultra-Low-Latency (`WasapiFlexAsioPair` pada `10 ms` atau Set Latency manual)
     ///   dan pembacaan **Pure Steady 1:1 FlexASIO (`read_stereo_rsb_flex_b_into`)** yang 100% bebas stutter dan bebas ubahan pitch!
     fn start_rsb_asio_backend(&mut self) {
         let host = cpal::default_host();
         let target_sr = self.sample_rate.clamp(44100, 192000);
         let unified_smp = self.rsb_asio_config.effective_buffer_size(self.buffer_size);
-        let out_v = self.rsb_asio_config.out_latency_val;
-        let out_extra_smp = if self.rsb_asio_config.set_out_latency_enabled && out_v > 0.0 && out_v < 0.5 {
-            ((out_v.min(0.250) as f64) * (target_sr as f64)).round() as usize
+        let in_v = if self.rsb_asio_config.set_in_latency_enabled {
+            self.rsb_asio_config.in_latency_val.clamp(0.0, 1000.0)
         } else {
-            0
+            0.0
         };
-        let std_200ms_smp = (((0.024 * (target_sr as f64)).round() as usize) + out_extra_smp).clamp(960, 24000);
+        let out_v = if self.rsb_asio_config.set_out_latency_enabled {
+            self.rsb_asio_config.out_latency_val.clamp(0.0, 1000.0)
+        } else {
+            0.0
+        };
+        let eff_cush_ms = (50.0 + out_v + in_v * 0.5).clamp(50.0, 450.0);
+        let std_200ms_smp = (((eff_cush_ms as f64) / 1000.0) * (target_sr as f64))
+            .round()
+            .clamp(1440.0, 24000.0) as usize;
         self.shared
             .rsb_asio_out_cush_smp
             .store(std_200ms_smp as u32, Ordering::Relaxed);
@@ -1340,7 +1482,7 @@ impl AudioPipeline {
             self.output_device_name = Some(self.rsb_asio_config.output_device.clone());
         }
 
-        let (in_idx_opt, out_idx_opt) = if self.name == "Line A" {
+        let (in_tgt_opt, out_tgt_opt) = if self.name == "Line A" {
             let Some(ref in_name) = self.input_device_name else {
                 self.status_message = "⚪ Inactive - select Input Device (WASAPI)".to_string();
                 return;
@@ -1349,19 +1491,16 @@ impl AudioPipeline {
                 self.status_message = "⚪ Inactive - select Input Device (WASAPI)".to_string();
                 return;
             };
-            let found_in = host
+            let exists = host
                 .input_devices()
                 .ok()
-                .and_then(|it| {
-                    it.enumerate()
-                        .find(|(_, d)| d.name().ok().as_deref() == Some(in_name.as_str()))
-                })
-                .map(|(idx, _)| idx);
-            if found_in.is_none() {
+                .map(|mut it| it.any(|d| d.name().ok().as_deref() == Some(in_name.as_str())))
+                .unwrap_or(false);
+            if !exists {
                 self.status_message = "⚠️ Error: Input Device not found".to_string();
                 return;
             }
-            (found_in, None)
+            (Some(WasapiEndpointTarget::ByName(in_name.clone())), None)
         } else {
             let Some(ref out_name) = self.output_device_name else {
                 self.status_message = "⚪ Inactive - select Output Device (WASAPI)".to_string();
@@ -1371,41 +1510,31 @@ impl AudioPipeline {
                 self.status_message = "⚪ Inactive - select Output Device (WASAPI)".to_string();
                 return;
             };
-            let found_out = host
+            let exists = host
                 .output_devices()
                 .ok()
-                .and_then(|it| {
-                    it.enumerate()
-                        .find(|(_, d)| d.name().ok().as_deref() == Some(out_name.as_str()))
-                })
-                .map(|(idx, _)| idx);
-            if found_out.is_none() {
+                .map(|mut it| it.any(|d| d.name().ok().as_deref() == Some(out_name.as_str())))
+                .unwrap_or(false);
+            if !exists {
                 self.status_message = "⚠️ Error: Output Device not found".to_string();
                 return;
             }
-            (None, found_out)
+            (None, Some(WasapiEndpointTarget::ByName(out_name.clone())))
         };
 
-        let in_v = self.rsb_asio_config.in_latency_val;
-        let set_in_opt = if self.rsb_asio_config.set_in_latency_enabled && in_v > 0.0 && in_v < 0.5 {
-            Some((in_v * 1000.0).min(250.0))
-        } else {
-            Some(0.0)
-        };
-        let set_out_opt = if self.rsb_asio_config.set_out_latency_enabled && out_v > 0.0 && out_v < 0.5 {
-            Some((out_v * 1000.0).min(250.0))
-        } else {
-            Some(0.0)
-        };
+        // Gunakan `set_latency_ms: Some(0.0)` pada `WasapiFlexAsioPair` (identik 100% dengan SoundBridge ASIO)
+        // agar stream hardware WASAPI Capture/Render selalu berjalan pada mode 10ms Event-Driven paling stabil
+        // untuk plugin berat seperti `Clear.vst3`, sedangkan nilai `Set Input/Output Latency (ms)` dialokasikan
+        // pada ring buffer jembatan ASIO (`BUS_DSP_B_IN`).
         let in_opts = FlexAsioEndpointOptions {
-            set_latency_ms: set_in_opt,
+            set_latency_ms: Some(0.0),
             wasapi_set: self.rsb_asio_config.wasapi_in_set,
             wasapi_exclusive: self.rsb_asio_config.wasapi_in_exclusive,
             wasapi_autoconvert: self.rsb_asio_config.wasapi_in_autoconvert,
             channels: self.rsb_asio_config.in_channels,
         };
         let out_opts = FlexAsioEndpointOptions {
-            set_latency_ms: set_out_opt,
+            set_latency_ms: Some(0.0),
             wasapi_set: self.rsb_asio_config.wasapi_out_set,
             wasapi_exclusive: self.rsb_asio_config.wasapi_out_exclusive,
             wasapi_autoconvert: self.rsb_asio_config.wasapi_out_autoconvert,
@@ -1418,8 +1547,8 @@ impl AudioPipeline {
         let mut scratch_direct = AudioScratchBuffers::with_capacity((unified_smp as usize).max(1024) * 4);
 
         let rsb_res = WasapiFlexAsioPair::try_start_with_options(
-            in_idx_opt,
-            out_idx_opt,
+            in_tgt_opt,
+            out_tgt_opt,
             target_sr,
             unified_smp,
             in_opts,
@@ -1439,11 +1568,13 @@ impl AudioPipeline {
                         let steady_cush = shared_out
                             .rsb_asio_out_cush_smp
                             .load(Ordering::Relaxed)
-                            .clamp(960, 24000) as usize;
-                        get_dsp_rsb_bus_b_in().read_stereo_rsb_flex_b_into(
+                            .clamp(1440, 24000) as usize;
+                        let (cush_target, stretch_en) = get_dsp_rsb_bus_b_in().get_dsp_b_params();
+                        get_dsp_rsb_bus_b_in().read_stereo_dsp_b_into(
                             &mut scratch_direct.bus_l[..frames],
                             &mut scratch_direct.bus_r[..frames],
-                            steady_cush,
+                            cush_target.max(steady_cush),
+                            stretch_en,
                         );
                         process_and_render_direct_stereo_from_scratch(
                             &shared_out,
@@ -1464,10 +1595,14 @@ impl AudioPipeline {
             Ok(pair) => {
                 let active_sr = pair.active_sample_rate;
                 let act_in = pair.actual_in_buf;
+                let act_out = pair.actual_out_buf;
                 self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
                 self.shared.actual_in_frames.store(act_in, Ordering::Relaxed);
-                self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                self.shared.actual_out_frames.store(act_out, Ordering::Relaxed);
+                self.shared.hw_cap_frames.store(pair.actual_in_hw_frames, Ordering::Relaxed);
+                self.shared.hw_ren_frames.store(pair.actual_out_hw_frames, Ordering::Relaxed);
+                self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                 self.sync_overlay_rates(active_sr);
                 let (rep_in_smp, rep_out_smp) = compute_rsb_flexasio_reported_latency_samples(
                     active_sr,
@@ -1478,9 +1613,10 @@ impl AudioPipeline {
                     self.rsb_asio_config.out_latency_val,
                 );
                 get_dsp_rsb_bus_a_out().sync_config(active_sr, unified_smp, rep_in_smp, rep_out_smp);
-                get_dsp_rsb_bus_b_in().set_adaptive_flags_with_mult(true, true, 1.05);
+                get_dsp_rsb_bus_b_in().set_adaptive_flags_with_mult(true, true, 1.15);
                 get_dsp_rsb_bus_b_in().set_adaptive_mode(3);
-                get_dsp_rsb_bus_b_in().set_user_extra_buffer_ms(0.0);
+                get_dsp_rsb_bus_b_in().set_user_extra_buffer_ms(25.0);
+                get_dsp_rsb_bus_b_in().set_user_stall_guard_ms(15.0);
                 get_dsp_rsb_bus_b_in().sync_config(
                     active_sr,
                     unified_smp,
@@ -1488,10 +1624,10 @@ impl AudioPipeline {
                     std_200ms_smp as u32,
                 );
                 if self.name == "Line A" {
-                    let in_cush = (unified_smp as usize * 2).clamp(480, 768);
-                    get_dsp_rsb_bus_a_out().reset_reader_with_cushion(in_cush);
-                } else {
-                    get_dsp_rsb_bus_b_in().reset_reader_with_cushion(std_200ms_smp);
+                    let bus_a = get_dsp_rsb_bus_a_out();
+                    if !bus_a.is_vc_active() {
+                        bus_a.reset_reader_with_cushion((unified_smp as usize * 4).clamp(1200, 1920));
+                    }
                 }
                 self.status_message = if self.name == "Line A" {
                     format!(
@@ -1504,7 +1640,7 @@ impl AudioPipeline {
                         unified_smp, active_sr
                     )
                 };
-                self.engine = ActiveStreamEngine::AsioExperimental { _pair: pair };
+                self.set_engine(ActiveStreamEngine::AsioExperimental { _pair: pair });
                 return;
             }
             Err(e) => {
@@ -1533,17 +1669,17 @@ impl AudioPipeline {
                         self.in_channels = act_ch;
                         self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
                         self.shared.actual_in_frames.store(unified_smp, Ordering::Relaxed);
-                        self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                        self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                        self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                        self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                         self.sync_overlay_rates(active_sr);
                         self.status_message = format!(
                             "🎛️ RSB ASIO [WASAPI In A ({}ch) -> VST A -> ASIO Out A @ {}Hz]",
                             act_ch, active_sr
                         );
-                        self.engine = ActiveStreamEngine::WasapiShared {
+                        self.set_engine(ActiveStreamEngine::WasapiShared {
                             _in_stream: Some(ins),
                             _out_stream: None,
-                        };
+                        });
                         return;
                     }
                 }
@@ -1566,17 +1702,17 @@ impl AudioPipeline {
                         self.out_channels = act_ch;
                         self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
                         self.shared.actual_in_frames.store(unified_smp, Ordering::Relaxed);
-                        self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                        self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                        self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                        self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                         self.sync_overlay_rates(active_sr);
                         self.status_message = format!(
                             "🎛️ RSB ASIO [Loopback B -> VST B -> WASAPI Out B ({}ch) @ {}Hz]",
                             act_ch, active_sr
                         );
-                        self.engine = ActiveStreamEngine::WasapiShared {
+                        self.set_engine(ActiveStreamEngine::WasapiShared {
                             _in_stream: None,
                             _out_stream: Some(outs),
-                        };
+                        });
                         return;
                     }
                 }
@@ -1604,7 +1740,7 @@ impl AudioPipeline {
             .ok()
             .and_then(|it| it.enumerate().find(|(_, d)| d.name().ok().as_deref() == Some(out_name.as_str())));
 
-        let ((in_idx, in_dev), (out_idx, out_dev)) = match (in_dev_opt, out_dev_opt) {
+        let ((_in_idx, in_dev), (_out_idx, out_dev)) = match (in_dev_opt, out_dev_opt) {
             (Some(i), Some(o)) => (i, o),
             _ => {
                 self.status_message = "⚠️ Error: WASAPI device not found".to_string();
@@ -1625,8 +1761,8 @@ impl AudioPipeline {
             let mut scratch_out = AudioScratchBuffers::with_capacity(self.buffer_size as usize * 2);
 
             let excl_res = WasapiExclusivePair::try_start(
-                in_idx,
-                out_idx,
+                WasapiEndpointTarget::ByName(in_name.clone()),
+                WasapiEndpointTarget::ByName(out_name.clone()),
                 self.sample_rate,
                 self.buffer_size,
                 move |data, ch, frames| {
@@ -1647,14 +1783,18 @@ impl AudioPipeline {
                 Ok(pair) => {
                     let active_sr = pair.active_sample_rate;
                     self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
-                    self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                    self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                    self.shared.hw_cap_frames.store(pair.active_in_buf_frames, Ordering::Relaxed);
+                    self.shared.hw_ren_frames.store(pair.active_out_buf_frames, Ordering::Relaxed);
+                    self.shared.actual_in_frames.store(pair.active_in_buf_frames, Ordering::Relaxed);
+                    self.shared.actual_out_frames.store(pair.active_out_buf_frames, Ordering::Relaxed);
+                    self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                    self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                     self.sync_overlay_rates(active_sr);
                     if active_sr != self.sample_rate {
                         let fifo = self.shared.fifo.lock();
                         fifo.configure(self.buffer_size as usize, Some(active_sr as f64));
                     }
-                    self.engine = ActiveStreamEngine::WasapiExclusive { _pair: pair };
+                    self.set_engine(ActiveStreamEngine::WasapiExclusive { _pair: pair });
                     self.status_message = format!(
                         "⚡ WASAPI Exclusive Active (2 In -> 2 Out @ {}Hz)",
                         active_sr
@@ -1671,8 +1811,6 @@ impl AudioPipeline {
         }
 
         // 2. ULTRA-OPTIMIZED WASAPI SHARED (Event-Driven Direct COM `WasapiFlexAsioPair` 10ms):
-        //    Memangkas ~45-55% latensi WASAPI Shared standar dibanding polling `cpal` sekaligus
-        //    menjaga kompatibilitas penuh multi-aplikasi (OBS / Discord / Browser) via AutoConvert PCM!
         if !try_exclusive {
             let unified_smp = self.buffer_size.clamp(32, 2048);
             {
@@ -1705,8 +1843,8 @@ impl AudioPipeline {
             let mut scratch_out = AudioScratchBuffers::with_capacity((unified_smp as usize).max(1024) * 4);
 
             if let Ok(pair) = WasapiFlexAsioPair::try_start_with_options(
-                Some(in_idx),
-                Some(out_idx),
+                Some(WasapiEndpointTarget::ByName(in_name.clone())),
+                Some(WasapiEndpointTarget::ByName(out_name.clone())),
                 self.sample_rate,
                 unified_smp,
                 fast_in_opts,
@@ -1726,16 +1864,20 @@ impl AudioPipeline {
             ) {
                 let active_sr = pair.active_sample_rate;
                 let act_in = pair.actual_in_buf;
+                let act_out = pair.actual_out_buf;
                 self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
                 self.shared.actual_in_frames.store(act_in, Ordering::Relaxed);
-                self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-                self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+                self.shared.actual_out_frames.store(act_out, Ordering::Relaxed);
+                self.shared.hw_cap_frames.store(pair.actual_in_hw_frames, Ordering::Relaxed);
+                self.shared.hw_ren_frames.store(pair.actual_out_hw_frames, Ordering::Relaxed);
+                self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+                self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
                 self.sync_overlay_rates(active_sr);
                 if active_sr != self.sample_rate {
                     let fifo = self.shared.fifo.lock();
                     fifo.configure_flex_asio(unified_smp as usize, 0, 0, Some(active_sr as f64));
                 }
-                self.engine = ActiveStreamEngine::AsioExperimental { _pair: pair };
+                self.set_engine(ActiveStreamEngine::AsioExperimental { _pair: pair });
                 self.status_message = format!(
                     "🟢 WASAPI Shared Fast-Event ({}smp @ {}Hz)",
                     unified_smp, active_sr
@@ -1773,12 +1915,12 @@ impl AudioPipeline {
                             self.finalize_shared_start(ins, outs, fallback_sr, try_exclusive);
                         }
                         Err(err2) => {
-                            self.status_message = format!("⚠️ Error: {}", &err2.chars().take(38).collect::<String>());
+                            self.status_message = format!("⚠️ Error: {}", err2.chars().take(38).collect::<String>());
                             log_error(format!("[{}] WASAPI Pipeline Error: {}", self.name, err2));
                         }
                     }
                 } else {
-                    self.status_message = format!("⚠️ Error: {}", &err1.chars().take(38).collect::<String>());
+                    self.status_message = format!("⚠️ Error: {}", err1.chars().take(38).collect::<String>());
                     log_error(format!("[{}] WASAPI Pipeline Error: {}", self.name, err1));
                 }
             }
@@ -1793,8 +1935,8 @@ impl AudioPipeline {
         was_excl_fallback: bool,
     ) {
         self.shared.active_sample_rate.store(active_sr, Ordering::Relaxed);
-        self.shared.probe_in.set_sample_rate(active_sr, 1.8);
-        self.shared.probe_out.set_sample_rate(active_sr, 1.8);
+        self.shared.probe_in.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
+        self.shared.probe_out.set_sample_rate(active_sr, LATENCY_PROBE_WINDOW_SECS);
         self.sync_overlay_rates(active_sr);
         {
             let fifo = self.shared.fifo.lock();
@@ -1825,10 +1967,10 @@ impl AudioPipeline {
             log_error(format!("[{}] Gagal play stream: {}", self.name, e));
             return;
         }
-        self.engine = ActiveStreamEngine::WasapiShared {
+        self.set_engine(ActiveStreamEngine::WasapiShared {
             _in_stream: Some(ins),
             _out_stream: Some(outs),
-        };
+        });
         if self.driver_backend == DriverBackend::AsioExperimental {
             self.status_message = format!(
                 "🚀 ASIO Exp [In {}smp -> Out {}smp @ {}Hz]",
@@ -2054,7 +2196,7 @@ impl AudioPipeline {
                         let steady_cush = shared
                             .rsb_asio_out_cush_smp
                             .load(Ordering::Relaxed)
-                            .clamp(480, 24000) as usize;
+                            .clamp(960, 48000) as usize;
                         get_dsp_rsb_bus_b_in().read_stereo_rsb_flex_b_into(
                             &mut scratch_direct.bus_l[..frames],
                             &mut scratch_direct.bus_r[..frames],
@@ -2069,13 +2211,22 @@ impl AudioPipeline {
                         );
                     } else if is_dsp_rsb_b {
                         scratch_direct.ensure_frames(frames);
-                        let (cush_target, stretch_en) = get_dsp_rsb_bus_b_in().get_dsp_b_params();
-                        get_dsp_rsb_bus_b_in().read_stereo_dsp_b_into(
-                            &mut scratch_direct.bus_l[..frames],
-                            &mut scratch_direct.bus_r[..frames],
-                            cush_target,
-                            stretch_en,
-                        );
+                        let b_bus = get_dsp_rsb_bus_b_in();
+                        let b_mode = b_bus.get_rsb_driver_mode();
+                        let vc_hb = b_bus.is_vc_active();
+                        // Strict Driver Mode Isolation on Line B (matches WasapiFlexAsioPair path)
+                        if (b_mode == 3 && !vc_hb) || b_mode == 4 {
+                            scratch_direct.bus_l[..frames].fill(0.0);
+                            scratch_direct.bus_r[..frames].fill(0.0);
+                        } else {
+                            let (cush_target, stretch_en) = b_bus.get_dsp_b_params();
+                            b_bus.read_stereo_dsp_b_into(
+                                &mut scratch_direct.bus_l[..frames],
+                                &mut scratch_direct.bus_r[..frames],
+                                cush_target,
+                                stretch_en,
+                            );
+                        }
                         process_and_render_direct_stereo_from_scratch(
                             &shared,
                             &mut scratch_direct,
@@ -2284,18 +2435,16 @@ fn run_dsp_vst_chain_stereo(
                     }
                 }
             }
-            Ok(Err(err_msg)) => {
+            Ok(Err(_err_msg)) => {
                 chain_failed = true;
                 plugin.reset();
-                slot.record_error(err_msg.clone());
-                log_slot_error(&shared.name, slot, &err_msg);
+                // Lock-free, zero-allocation error recording on RT thread; UI flushes log via flush_rt_error_log()
+                slot.record_error_rt(false, shared.elapsed_ms());
             }
             Err(_) => {
                 chain_failed = true;
                 plugin.reset();
-                let msg = "VST plugin encountered an internal panic".to_string();
-                slot.record_error(msg.clone());
-                log_slot_error(&shared.name, slot, &msg);
+                slot.record_error_rt(true, shared.elapsed_ms());
             }
         }
     }
@@ -2333,6 +2482,9 @@ fn process_input_block(
     let prev_r = &mut scratch.prev_r[..frames];
     let mono_probe = &mut scratch.mono_probe[..frames];
 
+    if in_ch == 0 {
+        return;
+    }
     if in_ch == 1 {
         for (i, &s) in indata.iter().take(frames).enumerate() {
             left[i] = s;
@@ -2340,7 +2492,7 @@ fn process_input_block(
             mono_probe[i] = s;
         }
     } else {
-        for (i, chunk) in indata.chunks(in_ch).take(frames).enumerate() {
+        for (i, chunk) in indata.chunks_exact(in_ch).take(frames).enumerate() {
             let l = chunk[0];
             let r = chunk[1];
             left[i] = l;
@@ -2353,7 +2505,7 @@ fn process_input_block(
 
     run_dsp_vst_chain_stereo(shared, left, right, prev_l, prev_r, frames);
 
-    // Jalur Langsung Bebas-FIFO untuk `BUS_LINE_A_OUT` (menuju Input Vonovox):
+    // Jalur Langsung Bebas-FIFO untuk `BUS_LINE_A_OUT` (menuju Input External VC):
     // Menulis sampel mikrofon yang sudah melewati DC Blocker + VST3 Chain + Master Gain Line A
     // LANGSUNG dari callback capture ke `BUS_LINE_A_OUT` tanpa melewati `AudioFIFO` Line A!
     let is_rsb_asio = shared.is_rsb_asio.load(Ordering::Relaxed);
@@ -2372,7 +2524,7 @@ fn process_input_block(
                 prev_r[i] = right[i] * gain;
             }
             shared.overlay_output_bank.mix_into(prev_l, prev_r);
-            // Gunakan sanitasi Float32 100% Bit-Exact tanpa kompresi ganda sebelum masuk ke Vonovox!
+            // Gunakan sanitasi Float32 100% Bit-Exact tanpa kompresi ganda sebelum masuk ke External VC!
             soft_limit_pre_vst_stereo(prev_l, prev_r);
         }
         if need_dsp_bus || need_asio_bus {
@@ -2390,9 +2542,11 @@ fn process_input_block(
                     peak = m;
                 }
             }
+            let prev_pk = f32::from_bits(shared.peak_level_bits.load(Ordering::Relaxed));
+            let smooth_pk = if peak >= prev_pk { 0.72 * peak + 0.28 * prev_pk } else { prev_pk * 0.94 };
             shared
                 .peak_level_bits
-                .store(peak.min(1.5).to_bits(), Ordering::Relaxed);
+                .store(smooth_pk.min(1.5).to_bits(), Ordering::Relaxed);
             return;
         }
     }
@@ -2418,6 +2572,7 @@ fn process_and_render_direct_stereo_from_scratch(
         return;
     }
     shared.actual_in_frames.store(frames as u32, Ordering::Relaxed);
+    shared.actual_out_frames.store(frames as u32, Ordering::Relaxed);
 
     scratch.ensure_frames(frames);
     for i in 0..frames {
@@ -2466,127 +2621,27 @@ fn process_and_render_direct_stereo_from_scratch(
         }
     }
     shared.probe_out.write(mono_probe);
+    let prev_pk = f32::from_bits(shared.peak_level_bits.load(Ordering::Relaxed));
+    let smooth_pk = if peak >= prev_pk { 0.72 * peak + 0.28 * prev_pk } else { prev_pk * 0.94 };
     shared
         .peak_level_bits
-        .store(peak.min(1.5).to_bits(), Ordering::Relaxed);
+        .store(smooth_pk.min(1.5).to_bits(), Ordering::Relaxed);
 
-    if out_ch == 1 {
-        for i in 0..frames {
-            outdata[i] = 0.5 * (left[i] + right[i]);
-        }
-    } else {
-        for (i, chunk) in outdata.chunks_mut(out_ch).take(frames).enumerate() {
-            chunk[0] = left[i];
-            chunk[1] = right[i];
-            for extra_ch in &mut chunk[2..] {
-                *extra_ch = 0.0;
-            }
-        }
-    }
-}
-
-/// Jalur langsung bebas-FIFO untuk Line B saat menerima hasil konversi dari `BUS_LINE_B_IN` (Vonovox).
-#[allow(dead_code)]
-fn process_and_render_direct_stereo_block(
-    shared: &SharedAudioState,
-    scratch: &mut AudioScratchBuffers,
-    bus_l: &[f32],
-    bus_r: &[f32],
-    outdata: &mut [f32],
-    out_ch: usize,
-    frames: usize,
-) {
-    enable_cpu_denormal_flush();
-    if !shared.is_enabled.load(Ordering::Relaxed) || frames == 0 {
-        outdata.fill(0.0);
-        shared.peak_level_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+    if out_ch == 0 {
         return;
     }
-    shared.actual_in_frames.store(frames as u32, Ordering::Relaxed);
-
-    scratch.ensure_frames(frames);
-    let left = &mut scratch.left[..frames];
-    let right = &mut scratch.right[..frames];
-    let prev_l = &mut scratch.prev_l[..frames];
-    let prev_r = &mut scratch.prev_r[..frames];
-    let mono_probe = &mut scratch.mono_probe[..frames];
-
-    for i in 0..frames {
-        let l = bus_l.get(i).copied().unwrap_or(0.0);
-        let r = bus_r.get(i).copied().unwrap_or(0.0);
-        left[i] = l;
-        right[i] = r;
-        mono_probe[i] = 0.5 * (l + r);
-    }
-    shared.probe_in.write(mono_probe);
-
-    run_dsp_vst_chain_stereo(shared, left, right, prev_l, prev_r, frames);
-
-    if shared.is_muted.load(Ordering::Relaxed) || shared.is_in_failsafe() {
-        left.fill(0.0);
-        right.fill(0.0);
-    } else {
-        let gain = f32::from_bits(shared.master_gain_bits.load(Ordering::Relaxed));
-        for i in 0..frames {
-            left[i] *= gain;
-            right[i] *= gain;
-        }
-        shared.overlay_output_bank.mix_into(left, right);
-        soft_limit_stereo(left, right);
-    }
-
-    let mut peak = 0.0f32;
-    for i in 0..frames {
-        let l = left[i];
-        let r = right[i];
-        mono_probe[i] = 0.5 * (l + r);
-        let m = l.abs().max(r.abs());
-        if m > peak {
-            peak = m;
-        }
-    }
-    shared.probe_out.write(mono_probe);
-    shared
-        .peak_level_bits
-        .store(peak.min(1.5).to_bits(), Ordering::Relaxed);
-
     if out_ch == 1 {
         for i in 0..frames {
             outdata[i] = 0.5 * (left[i] + right[i]);
         }
     } else {
-        for (i, chunk) in outdata.chunks_mut(out_ch).take(frames).enumerate() {
+        for (i, chunk) in outdata.chunks_exact_mut(out_ch).take(frames).enumerate() {
             chunk[0] = left[i];
             chunk[1] = right[i];
             for extra_ch in &mut chunk[2..] {
                 *extra_ch = 0.0;
             }
         }
-    }
-}
-
-fn log_slot_error(line_name: &str, slot: &VSTSlot, err_msg: &str) {
-    let now = Instant::now();
-    let mut last_guard = slot.last_logged_time.lock();
-    let should_log = match *last_guard {
-        None => true,
-        Some(prev) => now.saturating_duration_since(prev).as_secs_f64() >= 2.0,
-    };
-    if should_log {
-        let suppressed = slot.suppressed_logs.swap(0, Ordering::Relaxed);
-        *last_guard = Some(now);
-        let extra = if suppressed > 0 {
-            format!(" (+{} error disembunyikan)", suppressed)
-        } else {
-            String::new()
-        };
-        let count = slot.error_count.load(Ordering::Relaxed);
-        log_error(format!(
-            "[{}] VST '{}' gagal diproses (ke-{}x): {}{}",
-            line_name, slot.name, count, err_msg, extra
-        ));
-    } else {
-        slot.suppressed_logs.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2598,11 +2653,12 @@ fn render_output_block(
     frames: usize,
 ) {
     enable_cpu_denormal_flush();
-    if !shared.is_enabled.load(Ordering::Relaxed) || frames == 0 {
+    if !shared.is_enabled.load(Ordering::Relaxed) || frames == 0 || out_ch == 0 {
         outdata.fill(0.0);
         shared.peak_level_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
         return;
     }
+    shared.actual_out_frames.store(frames as u32, Ordering::Relaxed);
 
     scratch.ensure_frames(frames);
     let left = &mut scratch.left[..frames];
@@ -2629,7 +2685,7 @@ fn render_output_block(
             outdata[i] = 0.5 * (left[i] + right[i]);
         }
     } else {
-        for (i, chunk) in outdata.chunks_mut(out_ch).take(frames).enumerate() {
+        for (i, chunk) in outdata.chunks_exact_mut(out_ch).take(frames).enumerate() {
             chunk[0] = left[i];
             chunk[1] = right[i];
             for extra_ch in &mut chunk[2..] {
@@ -2649,7 +2705,494 @@ fn render_output_block(
         mono_probe[i] = 0.5 * (l + r);
     }
     shared.probe_out.write(mono_probe);
+    let prev_pk = f32::from_bits(shared.peak_level_bits.load(Ordering::Relaxed));
+    let smooth_pk = if peak >= prev_pk { 0.72 * peak + 0.28 * prev_pk } else { prev_pk * 0.94 };
     shared
         .peak_level_bits
-        .store(peak.min(1.5).to_bits(), Ordering::Relaxed);
+        .store(smooth_pk.min(1.5).to_bits(), Ordering::Relaxed);
+}
+
+
+/// Computes `(effective_pdc_samples, raw_daw_pdc_samples)` for a VST3 slot at sample rate `sr`
+/// for accurate latency reporting (using unclamped real VST3 `getLatencySamples()` PDC — never
+/// artificially truncating spectral denoisers like Supertone Clear from 68ms down to 40ms).
+pub fn effective_vst_slot_latency_samples(slot: &VSTSlot, sr: f64) -> (usize, usize) {
+    if slot.is_bypassed() {
+        return (0, 0);
+    }
+    let raw = slot.latency_samples.load(Ordering::Relaxed) as usize;
+    if raw > 0 {
+        return (raw, raw);
+    }
+    let ns = slot.last_process_ns.load(Ordering::Relaxed);
+    let dsp_smp = (((ns as f64) / 1_000_000_000.0) * sr).round() as usize;
+    if ns > 20_000 {
+        let active_smp = dsp_smp.min((sr * 0.005) as usize);
+        return (active_smp, 0);
+    }
+    (0, 0)
+}
+
+// =============================================================================
+// TRAY-SAFE BIDIRECTIONAL AUTO-RESET COORDINATOR (DEDICATED BACKGROUND THREAD)
+// =============================================================================
+// Runs independently of `eframe::App::update()` so that even when RSB is hidden
+// in System Tray (`SW_HIDE`, 0 Windows `WM_PAINT` / UI frames), RSB still polls
+// ORION->RSB reset signals (SHM bit 27 + `trigger_seq`), counts down its own
+// Cooldown/Target timer, executes in-place audio pipeline & bus micro-resets,
+// and signals RSB->ORION (SHM bit 31 + `trigger_seq` + `writer_id = 1`) cleanly
+// with zero window pop-up, zero UI race, and zero echo loops.
+
+/// Thread-safe snapshot of the Auto-Reset Watchdog state read by UI on restore/render.
+#[derive(Clone, Debug)]
+pub struct AutoResetSnapshot {
+    pub enabled: bool,
+    pub interval_mins: u32,
+    pub cooldown_mins: u32,
+    pub last_reset_ts: Instant,
+    pub line_b_silent_since: Option<Instant>,
+    pub pending: bool,
+    pub flash_until: Option<Instant>,
+    pub reset_count: u32,
+    pub last_reason: String,
+    pub config_dirty_from_peer: bool,
+    pub pending_restart_a: bool,
+    pub pending_restart_b: bool,
+}
+
+/// Transport abstraction for bidirectional RSB <-> ORION coordinated Auto-Reset.
+pub trait AutoResetTransport: Send + Sync + 'static {
+    /// Checks & atomically clears ORION->RSB reset bit (bit 27) on bus A & bus B.
+    fn check_and_clear_orion_reset_flags(&self) -> bool;
+    /// Atomically sets RSB->ORION reset bit (bit 31) on bus A & bus B.
+    fn trigger_rsb_reset_flags(&self);
+    /// Resets `BUS_DSP_A_OUT` ONLY if downstream VC/ORION is inactive (strict SPSC).
+    fn reset_bus_a_if_vc_inactive(&self);
+    /// Resets spike/cushion state on `BUS_DSP_B_IN`.
+    fn reset_bus_b_spike_and_resync(&self);
+    /// Reads the 64-byte `Local\RinkaOrionAutoResetSync_v1` packet.
+    fn read_sync_pkt(&self) -> Option<crate::asio_host::OrionAutoResetSyncPacket>;
+    /// Publishes RSB config (`writer_id = 1`), returning new `config_seq`.
+    fn publish_config_shm(&self, enabled: bool, interval_mins: u32, cooldown_mins: u32) -> u32;
+    /// Publishes RSB reset trigger (`writer_id = 1`), returning new `trigger_seq`.
+    fn publish_trigger_shm(&self, reset_count: u32) -> u32;
+    /// Mirrors RSB's earlier reset epoch into SHM so ORION follows the lower remaining timer.
+    fn sync_epoch_ms_shm(&self, epoch_ms: u64);
+    /// Current wall-clock epoch in milliseconds.
+    fn now_epoch_ms(&self) -> u64;
+    /// Post-reset housekeeping (clear measured delay, trim working set) — NEVER touches Win32 HWNDs!
+    fn on_reset_completed(&self);
+}
+
+struct AutoResetInner {
+    enabled: bool,
+    interval_mins: u32,
+    cooldown_mins: u32,
+    last_seen_cfg_seq: u32,
+    last_seen_trig_seq: u32,
+    last_reset_ts: Instant,
+    last_orion_reset_ts: Option<Instant>,
+    line_b_silent_since: Option<Instant>,
+    pending: bool,
+    flash_until: Option<Instant>,
+    reset_count: u32,
+    last_reason: String,
+    config_dirty_from_peer: bool,
+    pending_restart_a: bool,
+    pending_restart_b: bool,
+    silence_required_secs: f64,
+}
+
+/// Resets FIFO, DC Blocker, and VST3 flush/reset flags directly via `SharedAudioState`
+/// from any thread without tearing down active WASAPI/ASIO hardware streams.
+pub fn reset_shared_pipeline_in_place(shared: &SharedAudioState) -> bool {
+    if !shared.is_enabled.load(Ordering::Relaxed) {
+        return false;
+    }
+    let needs_restart = !shared.streams_running_flag.load(Ordering::Acquire)
+        || shared.stream_faulted.load(Ordering::Relaxed);
+    shared.fifo.lock().reset();
+    shared.dc_blocker.lock().reset();
+    let chain = shared.chain.load();
+    for slot in chain.iter() {
+        slot.reset_pending.store(true, Ordering::Relaxed);
+        slot.flush_pending.store(true, Ordering::Relaxed);
+    }
+    needs_restart
+}
+
+/// Single-owner thread-safe coordinator for periodic Auto-Reset & bidirectional ORION sync.
+pub struct AutoResetCoordinator {
+    shared_a: Arc<SharedAudioState>,
+    shared_b: Arc<SharedAudioState>,
+    transport: Arc<dyn AutoResetTransport>,
+    inner: Mutex<AutoResetInner>,
+    running: Arc<AtomicBool>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl AutoResetCoordinator {
+    pub fn new(
+        shared_a: Arc<SharedAudioState>,
+        shared_b: Arc<SharedAudioState>,
+        transport: Arc<dyn AutoResetTransport>,
+        enabled: bool,
+        interval_mins: u32,
+        cooldown_mins: u32,
+    ) -> Arc<Self> {
+        let iv = interval_mins.clamp(1, 240);
+        let cd = cooldown_mins.clamp(1, 240);
+        let seq_init = transport.publish_config_shm(enabled, iv, cd);
+        let init_trig = transport
+            .read_sync_pkt()
+            .map(|p| p.trigger_seq)
+            .unwrap_or(0);
+        Arc::new(Self {
+            shared_a,
+            shared_b,
+            transport,
+            inner: Mutex::new(AutoResetInner {
+                enabled,
+                interval_mins: iv,
+                cooldown_mins: cd,
+                last_seen_cfg_seq: seq_init,
+                last_seen_trig_seq: init_trig,
+                last_reset_ts: Instant::now(),
+                last_orion_reset_ts: None,
+                line_b_silent_since: None,
+                pending: false,
+                flash_until: None,
+                reset_count: 0,
+                last_reason: "Standby".to_string(),
+                config_dirty_from_peer: false,
+                pending_restart_a: false,
+                pending_restart_b: false,
+                silence_required_secs: 1.2,
+            }),
+            running: Arc::new(AtomicBool::new(false)),
+            worker: Mutex::new(None),
+        })
+    }
+
+    /// Spawns the dedicated background watchdog thread (`tick_interval` e.g. 150 ms).
+    /// Idempotent: calling twice does not spawn duplicate threads.
+    pub fn start_watchdog(self: &Arc<Self>, tick_interval: Duration) {
+        let mut slot = self.worker.lock();
+        if slot.is_some() {
+            return;
+        }
+        self.running.store(true, Ordering::SeqCst);
+        let me = Arc::clone(self);
+        let run_flag = Arc::clone(&self.running);
+        let period = tick_interval.max(Duration::from_millis(20));
+        if let Ok(handle) = std::thread::Builder::new()
+            .name("rinka-autoreset-watchdog".to_string())
+            .spawn(move || {
+                enable_cpu_denormal_flush();
+                let slice = Duration::from_millis(25).min(period);
+                let mut next_tick = Instant::now();
+                while run_flag.load(Ordering::Acquire) {
+                    let now = Instant::now();
+                    if now >= next_tick {
+                        me.tick_once(now);
+                        next_tick = now + period;
+                    }
+                    let rem = next_tick.saturating_duration_since(Instant::now());
+                    std::thread::sleep(rem.min(slice));
+                }
+            })
+        {
+            *slot = Some(handle);
+        } else {
+            self.running.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Stops and joins the background watchdog thread cleanly.
+    pub fn stop_watchdog(&self) {
+        self.running.store(false, Ordering::SeqCst);
+        if let Some(h) = self.worker.lock().take() {
+            let _ = h.join();
+        }
+    }
+
+    /// Returns a lock-free-friendly UI snapshot (used by `App::update()` & tray restore).
+    pub fn snapshot(&self) -> AutoResetSnapshot {
+        let st = self.inner.lock();
+        AutoResetSnapshot {
+            enabled: st.enabled,
+            interval_mins: st.interval_mins,
+            cooldown_mins: st.cooldown_mins,
+            last_reset_ts: st.last_reset_ts,
+            line_b_silent_since: st.line_b_silent_since,
+            pending: st.pending,
+            flash_until: st.flash_until,
+            reset_count: st.reset_count,
+            last_reason: st.last_reason.clone(),
+            config_dirty_from_peer: st.config_dirty_from_peer,
+            pending_restart_a: st.pending_restart_a,
+            pending_restart_b: st.pending_restart_b,
+        }
+    }
+
+    /// Consumes a remote ORION config update if one arrived while hidden in tray or active.
+    pub fn take_peer_config_if_dirty(&self) -> Option<(bool, u32, u32)> {
+        let mut st = self.inner.lock();
+        if st.config_dirty_from_peer {
+            st.config_dirty_from_peer = false;
+            Some((st.enabled, st.interval_mins, st.cooldown_mins))
+        } else {
+            None
+        }
+    }
+
+    /// Consumes any deferred faulted-stream restart flags recorded during background reset.
+    pub fn take_pending_restarts(&self) -> (bool, bool) {
+        let mut st = self.inner.lock();
+        let res = (st.pending_restart_a, st.pending_restart_b);
+        st.pending_restart_a = false;
+        st.pending_restart_b = false;
+        res
+    }
+
+    /// Updates Auto-Reset config from UI / startup load and publishes atomically to SHM.
+    pub fn update_config_from_ui(
+        &self,
+        enabled: bool,
+        interval_mins: u32,
+        cooldown_mins: u32,
+        reset_timer_now: bool,
+    ) {
+        let mut st = self.inner.lock();
+        let iv = interval_mins.clamp(1, 240);
+        let cd = cooldown_mins.clamp(1, 240);
+        st.enabled = enabled;
+        st.interval_mins = iv;
+        st.cooldown_mins = cd;
+        st.config_dirty_from_peer = false;
+        if reset_timer_now {
+            st.last_reset_ts = Instant::now();
+            st.line_b_silent_since = None;
+            st.pending = false;
+        }
+        st.last_seen_cfg_seq = self.transport.publish_config_shm(enabled, iv, cd);
+        if let Some(pkt) = self.transport.read_sync_pkt() {
+            if reset_timer_now && st.reset_count == 0 {
+                st.last_seen_trig_seq = pkt.trigger_seq;
+            }
+        }
+    }
+
+    /// Clears `pending` flag (e.g. after manual Refresh Audio Devices).
+    pub fn clear_pending_flag(&self) {
+        let mut st = self.inner.lock();
+        st.pending = false;
+    }
+
+    /// Executes an immediate RSB-initiated coordinated fast micro-reset (e.g., Reset Now button).
+    pub fn trigger_manual_reset(&self, reason: &str) {
+        let mut st = self.inner.lock();
+        let now = Instant::now();
+        self.execute_reset_locked(&mut st, now, reason, false);
+    }
+
+    /// Test helper: backdates `last_reset_ts` and tunes silence threshold so automated tests
+    /// can exercise the real background watchdog thread deterministically in milliseconds.
+    pub fn configure_timing_for_test(&self, backdate_last_reset: Duration, silence_required_secs: f64) {
+        let mut st = self.inner.lock();
+        let now = Instant::now();
+        st.last_reset_ts = now.checked_sub(backdate_last_reset).unwrap_or(now);
+        st.line_b_silent_since = None;
+        st.silence_required_secs = silence_required_secs.max(0.0);
+    }
+
+    /// Executes one single-owner watchdog tick: SHM bidirectional sync, Line B silence detection,
+    /// countdown check, and coordinated reset execution (zero UI / Win32 HWND dependencies).
+    pub fn tick_once(&self, now: Instant) {
+        let mut st = self.inner.lock();
+        let mut orion_shm_trig = false;
+
+        if let Some(sync_pkt) = self.transport.read_sync_pkt() {
+            if sync_pkt.config_seq != st.last_seen_cfg_seq {
+                st.last_seen_cfg_seq = sync_pkt.config_seq;
+                if sync_pkt.writer_id == 2 {
+                    let new_en = sync_pkt.enabled != 0;
+                    let new_iv = sync_pkt.interval_mins.clamp(1, 240);
+                    let new_cd = sync_pkt.cooldown_mins.clamp(1, 240);
+                    let changed_any = st.enabled != new_en
+                        || st.interval_mins != new_iv
+                        || st.cooldown_mins != new_cd;
+                    st.enabled = new_en;
+                    st.interval_mins = new_iv;
+                    st.cooldown_mins = new_cd;
+                    if changed_any {
+                        st.config_dirty_from_peer = true;
+                    }
+                }
+            }
+            if sync_pkt.trigger_seq != st.last_seen_trig_seq {
+                st.last_seen_trig_seq = sync_pkt.trigger_seq;
+                if sync_pkt.writer_id == 2 {
+                    orion_shm_trig = true;
+                }
+            } else {
+                let now_ep = self.transport.now_epoch_ms();
+                let local_el_ms = now.saturating_duration_since(st.last_reset_ts).as_millis() as u64;
+                let max_valid_ms = ((st.interval_mins.clamp(1, 240) as u64) * 60 + 120) * 1000;
+                if sync_pkt.last_reset_epoch_ms > 1_000_000_000_000
+                    && sync_pkt.last_reset_epoch_ms <= now_ep
+                {
+                    let peer_el_ms = now_ep.saturating_sub(sync_pkt.last_reset_epoch_ms);
+                    if peer_el_ms <= max_valid_ms {
+                        if peer_el_ms > local_el_ms + 1000 {
+                            if let Some(adj_ts) = now.checked_sub(Duration::from_millis(peer_el_ms)) {
+                                st.last_reset_ts = adj_ts;
+                            }
+                        } else if local_el_ms > peer_el_ms + 1000 && local_el_ms <= max_valid_ms {
+                            self.transport
+                                .sync_epoch_ms_shm(now_ep.saturating_sub(local_el_ms));
+                        }
+                    }
+                }
+            }
+        }
+
+        let cooldown_secs = (st.cooldown_mins.clamp(1, 240) as f64) * 60.0;
+        let interval_secs = (st.interval_mins.clamp(1, 240) as f64) * 60.0;
+        let hard_limit_secs = interval_secs + 60.0;
+        let up_secs = now.saturating_duration_since(st.last_reset_ts).as_secs_f64();
+
+        let a_run = self.shared_a.streams_running_flag.load(Ordering::Acquire);
+        let b_en = self.shared_b.is_enabled.load(Ordering::Relaxed);
+        let b_run = self.shared_b.streams_running_flag.load(Ordering::Acquire);
+
+        if st.enabled && up_secs >= cooldown_secs {
+            let line_a_peak = f32::from_bits(self.shared_a.peak_level_bits.load(Ordering::Relaxed));
+            let line_b_peak = f32::from_bits(self.shared_b.peak_level_bits.load(Ordering::Relaxed));
+            let is_mic_muted = line_a_peak <= 0.0012;
+            let is_line_b_zero = !b_en
+                || !b_run
+                || line_b_peak <= 0.0025
+                || (is_mic_muted && line_b_peak <= 0.0060);
+            if is_line_b_zero {
+                if st.line_b_silent_since.is_none() {
+                    st.line_b_silent_since = Some(now);
+                }
+            } else {
+                st.line_b_silent_since = None;
+                if line_a_peak >= 0.008 || line_b_peak >= 0.008 {
+                    st.last_reason = "Active Voice Armed".to_string();
+                }
+            }
+        } else {
+            st.line_b_silent_since = None;
+        }
+
+        if st.enabled && (a_run || b_run) {
+            let silent_secs = st
+                .line_b_silent_since
+                .map(|t| now.saturating_duration_since(t).as_secs_f64())
+                .unwrap_or(0.0);
+            let orion_bit27 = self.transport.check_and_clear_orion_reset_flags();
+            let orion_coord_req = orion_shm_trig || orion_bit27;
+
+            if orion_coord_req {
+                // Deduplicate split arrival of bit 27 and `trigger_seq` from the same ORION reset.
+                let recently_handled_orion = st
+                    .last_orion_reset_ts
+                    .map(|t| now.saturating_duration_since(t) < Duration::from_secs(2))
+                    .unwrap_or(false);
+                if !recently_handled_orion {
+                    self.execute_reset_locked(
+                        &mut st,
+                        now,
+                        "ORION Coordinated Silent Reset Signal",
+                        true,
+                    );
+                }
+            } else if up_secs >= interval_secs {
+                st.pending = true;
+                if silent_secs >= st.silence_required_secs {
+                    self.execute_reset_locked(
+                        &mut st,
+                        now,
+                        "Target Timer Reached + Silent >= 1.2s",
+                        false,
+                    );
+                } else if up_secs >= hard_limit_secs {
+                    self.execute_reset_locked(
+                        &mut st,
+                        now,
+                        "Target Timer + 60s Hard Limit Fallback",
+                        false,
+                    );
+                }
+            } else if up_secs >= cooldown_secs && silent_secs >= st.silence_required_secs {
+                let cd_m = st.cooldown_mins;
+                self.execute_reset_locked(
+                    &mut st,
+                    now,
+                    &format!("Silent >= 1.2s ({}m Cooldown Passed)", cd_m),
+                    false,
+                );
+            } else {
+                st.pending = false;
+            }
+        } else {
+            let _ = self.transport.check_and_clear_orion_reset_flags();
+            st.pending = false;
+        }
+    }
+
+    fn execute_reset_locked(
+        &self,
+        st: &mut AutoResetInner,
+        now: Instant,
+        reason: &str,
+        is_from_orion: bool,
+    ) {
+        let t0 = Instant::now();
+        if !is_from_orion {
+            // RSB-initiated reset: set bit 31 (`FROM_RSB`) & publish `trigger_seq` (`writer_id = 1`).
+            self.transport.trigger_rsb_reset_flags();
+            let next_cnt = st.reset_count.saturating_add(1);
+            st.last_seen_trig_seq = self.transport.publish_trigger_shm(next_cnt);
+        } else {
+            // ORION-initiated reset: NEVER echo bit 31 or `publish_trigger_shm` back to ORION!
+            st.last_orion_reset_ts = Some(now);
+            if let Some(pkt) = self.transport.read_sync_pkt() {
+                st.last_seen_trig_seq = pkt.trigger_seq;
+            }
+        }
+
+        self.transport.reset_bus_b_spike_and_resync();
+        if reset_shared_pipeline_in_place(&self.shared_a) {
+            st.pending_restart_a = true;
+        }
+        if self.shared_a.is_enabled.load(Ordering::Relaxed) {
+            self.transport.reset_bus_a_if_vc_inactive();
+        }
+        if reset_shared_pipeline_in_place(&self.shared_b) {
+            st.pending_restart_b = true;
+        }
+        self.transport.on_reset_completed();
+
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        st.last_reset_ts = now;
+        st.line_b_silent_since = None;
+        st.pending = false;
+        st.reset_count = st.reset_count.saturating_add(1);
+        st.flash_until = Some(now + Duration::from_millis(1800));
+        st.last_reason = format!("{} ({:.1}ms)", reason, elapsed_ms);
+        log_info(format!(
+            "[Auto-Reset v2.3] Fast periodic stream reset #{} completed in {:.1} ms (Trigger: {}, Interval: {} min)",
+            st.reset_count, elapsed_ms, reason, st.interval_mins
+        ));
+    }
+}
+
+impl Drop for AutoResetCoordinator {
+    fn drop(&mut self) {
+        self.stop_watchdog();
+    }
 }

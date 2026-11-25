@@ -129,4 +129,4 @@ dist\
 | **1. Direct RAM Pipe (Zero Virtual Cable)** | `🚀 ORION` | **Input**: Your Microphone (e.g., `SSL 1 Input`) | **ORION** (Direct Shared Memory Pipe) | **Output**: Your Headphones / Speakers |
 | **2. Internal Loopback (No Virtual Cable)** | `🎛️ Rsb ASIO (Experimental)` | **Input**: Your Microphone | **Driver**: `ASIO`<br>**Device**: `RSB ASIO` | **Output**: Your Headphones / Speakers |
 | **3. Adaptive GPU Cushion Bridge** | `⚡ SoundBridge ASIO (Experimental)` | **Input**: Your Microphone | **Driver**: `ASIO`<br>**Device**: `Rinka SoundBridge ASIO` | **Output**: Your Headphones / Speakers |
-| **4. Classic Hardware / Virtual Loopback** | `🔊 WASAPI Shared` | **Input**: `SSL 1 Input`<br>**Output**: `Output 1/2 (Loopback 1)` | **Driver**: `WASAPI` or `FlexASIO`<br>**In**: `Loopback 1` -> **Out**: `Loopback 2` | **Input**: `Loopback 2`<br>**Output**: Your Headphones |
+| **4. Classic Hardware / Virtual Loopback** | `🔊 WASAPI Shared` | **Input**: `SSL 1 Input`<br>**Output**: `Output 1/2 (Loopback 1)` | **Driver**: `WASAPI` or `FlexASIO`<br>**In**: `Loopback 1` -> **Out**: `Output 3/4 (Loopback 2)` | **Input**: `Loopback 2`<br>**Output**: Your Headphones |

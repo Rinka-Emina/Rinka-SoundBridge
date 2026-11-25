@@ -9,7 +9,7 @@
 > This software was originally developed independently with the assistance of AI to solve my own personal audio routing and voice changer pipeline needs (rather than pirating commercial software or juggling two separate applications). This repository is shared openly (*as-is*) for anyone who might find it useful, just in case.  
 > If anyone in the community wishes to take it further, fork it, or build upon it, please feel free—in fact, I'd be genuinely happy to see someone develop it further rather than relying on this AI-assisted result. This application was built solely to address my own personal use case.
 >
-> **Version & Release Note:** Versions `v2.1` and `v2.2` were private internal builds. Public release **`v2.3.0`** ships as prebuilt Windows x64 binaries (`RinkaSoundBridge.exe` + `rinka_soundbridge_core.dll`) in GitHub Releases (always unencrypted—no password-protected ZIPs).
+> **Version & Release Note:** Versions `v2.1` and `v2.2` were private internal builds. Public release **`v2.3.0`** ships as prebuilt Windows x64 binaries (`RinkaSoundBridge.exe` + `rinka_soundbridge_core.dll`) in GitHub Releases.
 
 ## Rinka SoundBridge only using VST3
 
